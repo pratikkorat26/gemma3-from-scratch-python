@@ -83,7 +83,7 @@ flowchart TD
     M --> J
     L -->|yes| N[result]
     N -->|non-stream| O[JSON chat.completion]
-    N -->|stream| P[SSE chat.completion.chunk + [DONE]]
+    N -->|stream| P["SSE chat.completion.chunk + [DONE]"]
 ```
 
 ## Validation
