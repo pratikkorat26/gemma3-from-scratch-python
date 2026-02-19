@@ -39,7 +39,11 @@ class LLMEngine:
             request_id=request_id,
             prompt_token_ids=self._encode_prompt(prompt),
             sampling=sampling or self.config.sampling,
-            max_new_tokens=max_new_tokens or self.config.max_new_tokens,
+            max_new_tokens=(
+                max_new_tokens
+                if max_new_tokens is not None
+                else self.config.max_new_tokens
+            ),
             eos_token_id=self.runtime.tokenizer.eos_token_id,
             created_at_s=created_at_s,
         )

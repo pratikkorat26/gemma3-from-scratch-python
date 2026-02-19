@@ -1,1 +1,6 @@
-./gemma-3-270m-it
+gemma-3-270m/
+gemma-3-270m-it/
+__pycache__/
+**/__pycache__/
+*.pyc
+.idea/

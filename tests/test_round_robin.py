@@ -137,6 +137,16 @@ class RoundRobinSchedulerTests(unittest.TestCase):
             self.assertEqual(result.stop_reason, "max_new_tokens")
             self.assertIsNone(result.error_message)
 
+    def test_zero_max_new_tokens_respected(self):
+        runtime = FakeRuntime()
+        engine = LLMEngine(runtime=runtime, config=self.config)
+
+        result = engine.generate_many(["1"], max_new_tokens=0)[0]
+
+        self.assertEqual(result.stop_reason, "max_new_tokens")
+        self.assertEqual(result.token_ids, [])
+        self.assertEqual(result.text, "")
+
 
 if __name__ == "__main__":
     unittest.main()
