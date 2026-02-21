@@ -26,6 +26,16 @@ class FakeTokenizer:
         return "".join(f"<{token_id}>" for token_id in ids)
 
 
+class FakeTokenizerSequence:
+    eos_token_id = 999
+
+    def encode(self, text):
+        return [int(part) for part in text.split()]
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(f"<{token_id}>" for token_id in ids)
+
+
 class FakePagedModel:
     def __init__(self, fail_on_token=None, *, strict_cache_check=True):
         self.context_length = 1024
@@ -99,6 +109,45 @@ class FakePagedModel:
         return logits
 
 
+class FakeModel:
+    def __init__(self, fail_on_token=None):
+        self.context_length = 1024
+        self.fail_on_token = fail_on_token
+        self.call_last_tokens = []
+        self.call_input_lengths = []
+        self.call_seq_lens = []
+
+    def init_paged_kv_caches(self, *, num_blocks, block_size, device):
+        return []
+
+    def __call__(
+        self,
+        input_ids,
+        *,
+        block_tables=None,
+        kv_lens=None,
+        paged_kv_caches=None,
+        past_kv=None,
+        use_cache=True,
+    ):
+        batch_size, seq_len = input_ids.shape
+        self.call_input_lengths.append(int(seq_len))
+        last_tokens = [int(input_ids[idx, -1].item()) for idx in range(batch_size)]
+        self.call_last_tokens.extend(last_tokens)
+        self.call_seq_lens.extend([seq_len] * batch_size)
+        for last_token in last_tokens:
+            if self.fail_on_token is not None and last_token == self.fail_on_token:
+                raise RuntimeError(f"forced failure on token {last_token}")
+
+        vocab_size = 4096
+        logits = torch.full((batch_size, seq_len, vocab_size), -1e9)
+        for batch_idx in range(batch_size):
+            current_token = int(input_ids[batch_idx, -1].item())
+            next_token = current_token + 10
+            logits[batch_idx, -1, next_token] = 0.0
+        return logits
+
+
 class FakeRuntime:
     def __init__(self, fail_on_token=None, *, strict_cache_check=True):
         self.device = torch.device("cpu")
@@ -107,6 +156,13 @@ class FakeRuntime:
             fail_on_token=fail_on_token,
             strict_cache_check=strict_cache_check,
         )
+
+
+class FakeRuntimeSequence:
+    def __init__(self):
+        self.device = torch.device("cpu")
+        self.tokenizer = FakeTokenizerSequence()
+        self.model = FakeModel()
 
 
 class RoundRobinSchedulerTests(unittest.TestCase):
@@ -338,7 +394,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         engine._init_request(long_request)
         engine._init_request(short_request)
 
-        logits = engine._run_prefill_chunk([long_request][0])
+        logits = engine._run_prefill_chunk(long_request)
         self.assertIsNone(logits)
 
         final_short_logits = engine._run_prefill_chunk(short_request)
@@ -431,6 +487,32 @@ class RoundRobinSchedulerTests(unittest.TestCase):
 
         self.assertEqual([request.request_id for request in batch], [2, 3])
         self.assertEqual([request.request_id for request in decode_queue], [1, 4, 5, 6])
+
+    def test_prefix_cache_reduces_prefill_input_tokens(self):
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=1,
+            num_prefill_workers=1,
+            num_decode_workers=1,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+            prefix_cache_enabled=True,
+            prefix_cache_min_tokens=2,
+            prefix_cache_max_bytes=64 * 1024 * 1024,
+        )
+        runtime = FakeRuntimeSequence()
+        engine = LLMEngine(runtime=runtime, config=config)
+
+        results = engine.generate_many(["1 2 3 4", "1 2 3 4"])
+
+        self.assertEqual([r.stop_reason for r in results], ["max_new_tokens", "max_new_tokens"])
+        self.assertEqual(runtime.model.call_input_lengths[0], 4)
+        self.assertEqual(runtime.model.call_input_lengths[1], 1)
 
 
 if __name__ == "__main__":

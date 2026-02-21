@@ -24,3 +24,6 @@ class EngineConfig:
     kv_block_size: int = 16
     num_kv_blocks: Optional[int] = None
     prefill_chunk_size: Optional[int] = None
+    prefix_cache_enabled: bool = False
+    prefix_cache_min_tokens: int = 16
+    prefix_cache_max_bytes: int = 512 * 1024 * 1024
