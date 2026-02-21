@@ -18,3 +18,6 @@ class EngineConfig:
     num_prefill_workers: int = 1
     num_decode_workers: int = 1
     max_decode_batch_size: int = 4
+    prefix_cache_enabled: bool = False
+    prefix_cache_min_tokens: int = 16
+    prefix_cache_max_bytes: int = 512 * 1024 * 1024

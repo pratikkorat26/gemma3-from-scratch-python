@@ -22,14 +22,26 @@ class FakeTokenizer:
         return "".join(f"<{token_id}>" for token_id in ids)
 
 
+class FakeTokenizerSequence:
+    eos_token_id = 999
+
+    def encode(self, text):
+        return [int(part) for part in text.split()]
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(f"<{token_id}>" for token_id in ids)
+
+
 class FakeModel:
     def __init__(self, fail_on_token=None):
         self.context_length = 1024
         self.fail_on_token = fail_on_token
         self.call_last_tokens = []
+        self.call_input_lengths = []
 
     def __call__(self, input_ids, past_kv=None, use_cache=True):
         batch_size = int(input_ids.shape[0])
+        self.call_input_lengths.append(int(input_ids.shape[1]))
         last_tokens = [int(input_ids[idx, -1].item()) for idx in range(batch_size)]
         self.call_last_tokens.extend(last_tokens)
         for last_token in last_tokens:
@@ -89,6 +101,13 @@ class FakeRuntimeStrictCache:
         self.model = FakeModelWithStrictCacheIsolation()
 
 
+class FakeRuntimeSequence:
+    def __init__(self):
+        self.device = torch.device("cpu")
+        self.tokenizer = FakeTokenizerSequence()
+        self.model = FakeModel()
+
+
 class RoundRobinSchedulerTests(unittest.TestCase):
     def setUp(self):
         self.config = EngineConfig(
@@ -146,6 +165,32 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual(result.stop_reason, "max_new_tokens")
         self.assertEqual(result.token_ids, [])
         self.assertEqual(result.text, "")
+
+    def test_prefix_cache_reduces_prefill_input_tokens(self):
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=1,
+            num_prefill_workers=1,
+            num_decode_workers=1,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+            prefix_cache_enabled=True,
+            prefix_cache_min_tokens=2,
+            prefix_cache_max_bytes=64 * 1024 * 1024,
+        )
+        runtime = FakeRuntimeSequence()
+        engine = LLMEngine(runtime=runtime, config=config)
+
+        results = engine.generate_many(["1 2 3 4", "1 2 3 4"])
+
+        self.assertEqual([r.stop_reason for r in results], ["max_new_tokens", "max_new_tokens"])
+        self.assertEqual(runtime.model.call_input_lengths[0], 4)
+        self.assertEqual(runtime.model.call_input_lengths[1], 1)
 
 
 if __name__ == "__main__":
