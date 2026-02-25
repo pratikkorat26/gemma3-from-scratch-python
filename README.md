@@ -1,4 +1,4 @@
-# Gemma 3 270M: Readable Minimal Implementation
+# Inference Engine for Gemma3 270M From Scratch
 
 This repository is a clean, minimal PyTorch implementation of Gemma-3-style inference, built to be easy to read and extend.
 
