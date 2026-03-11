@@ -22,6 +22,8 @@ class RequestState:
     past_kv: LayerCache = None
     current_input: Optional[torch.Tensor] = None
     text_chunks: List[str] = field(default_factory=list)
+    reserved_kv_cache_tokens: int = 0
+    kv_cache_released: bool = False
     status: str = "queued"
     stop_reason: Optional[str] = None
     error_message: Optional[str] = None

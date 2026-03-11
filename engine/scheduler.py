@@ -10,6 +10,31 @@ from .sampling import apply_repetition_penalty_, sample_next_token
 from .types import GenerationResult, RequestState, StreamEvent
 
 
+class KVCapacityManager:
+    def __init__(self, max_kv_cache_tokens: int):
+        if max_kv_cache_tokens <= 0:
+            raise ValueError("max_kv_cache_tokens must be > 0")
+        self.max_kv_cache_tokens = int(max_kv_cache_tokens)
+        self._reserved_tokens = 0
+
+    @property
+    def reserved_tokens(self) -> int:
+        return self._reserved_tokens
+
+    def can_reserve(self, token_count: int) -> bool:
+        return token_count >= 0 and (self._reserved_tokens + token_count) <= self.max_kv_cache_tokens
+
+    def reserve(self, token_count: int) -> None:
+        if not self.can_reserve(token_count):
+            raise ValueError("KV cache capacity exceeded")
+        self._reserved_tokens += token_count
+
+    def release(self, token_count: int) -> None:
+        if token_count <= 0:
+            return
+        self._reserved_tokens = max(0, self._reserved_tokens - token_count)
+
+
 class LLMEngine:
     """
     Single-device scheduler with explicit prefill/decode phases.
@@ -21,6 +46,7 @@ class LLMEngine:
     def __init__(self, runtime: GemmaRuntime, config: EngineConfig):
         self.runtime = runtime
         self.config = config
+        self.capacity = KVCapacityManager(max_kv_cache_tokens=self.config.max_kv_cache_tokens)
 
     def _encode_prompt(self, prompt: str) -> List[int]:
         if self.config.use_instruct_model:
@@ -51,12 +77,33 @@ class LLMEngine:
     def _context_limit(self) -> int:
         return int(self.runtime.model.context_length)
 
+    def _estimate_kv_cache_tokens(self, request: RequestState) -> int:
+        requested_total = len(request.prompt_token_ids) + max(0, int(request.max_new_tokens))
+        return min(self._context_limit(), requested_total)
+
+    def _try_reserve_request_capacity(self, request: RequestState) -> bool:
+        if request.reserved_kv_cache_tokens > 0 and not request.kv_cache_released:
+            return True
+        request.reserved_kv_cache_tokens = self._estimate_kv_cache_tokens(request)
+        request.kv_cache_released = False
+        if not self.capacity.can_reserve(request.reserved_kv_cache_tokens):
+            return False
+        self.capacity.reserve(request.reserved_kv_cache_tokens)
+        return True
+
+    def _release_request_capacity(self, request: RequestState) -> None:
+        if request.kv_cache_released:
+            return
+        self.capacity.release(request.reserved_kv_cache_tokens)
+        request.kv_cache_released = True
+
     def _finish_request(self, request: RequestState, reason: str, error_message: Optional[str] = None) -> None:
         request.status = "finished" if reason != "error" else "error"
         request.phase = request.status
         request.stop_reason = reason
         request.error_message = error_message
         request.finished_at_s = time.perf_counter()
+        self._release_request_capacity(request)
 
     def _init_request(self, request: RequestState) -> None:
         request.status = "active"
@@ -66,6 +113,7 @@ class LLMEngine:
         request.seen_token_ids = set(request.prompt_token_ids)
         request.text_chunks = []
         request.past_kv = None
+        request.kv_cache_released = False
         request.stop_reason = None
         request.error_message = None
         request.prefill_time_s = 0.0
@@ -285,15 +333,31 @@ class LLMEngine:
             if prefill_queue and len(decode_queue) < max(1, int(self.config.max_decode_batch_size)):
                 request = prefill_queue.popleft()
                 try:
-                    if request.first_scheduled_at_s is None:
-                        request.first_scheduled_at_s = time.perf_counter()
-                        self._init_request(request)
-
                     if request.max_new_tokens <= 0:
                         self._finish_request(request, reason="max_new_tokens")
                     elif len(request.prompt_token_ids) >= self._context_limit():
                         self._finish_request(request, reason="context_limit")
+                    elif self._estimate_kv_cache_tokens(request) > self.capacity.max_kv_cache_tokens:
+                        self._finish_request(
+                            request,
+                            reason="capacity_exceeded",
+                            error_message="KV cache capacity exceeded",
+                        )
                     else:
+                        if request.first_scheduled_at_s is None:
+                            if not self._try_reserve_request_capacity(request):
+                                prefill_queue.append(request)
+                                if decode_queue:
+                                    continue
+                                self._finish_request(
+                                    request,
+                                    reason="capacity_exceeded",
+                                    error_message="KV cache capacity exceeded",
+                                )
+                                results[request.request_id] = self._make_result(request)
+                                continue
+                            request.first_scheduled_at_s = time.perf_counter()
+                            self._init_request(request)
                         request.phase = "prefill"
                         self._run_one_step(request, phase="prefill")
                 except Exception as exc:
@@ -342,7 +406,6 @@ class LLMEngine:
             created_at_s=time.perf_counter(),
         )
         request.first_scheduled_at_s = time.perf_counter()
-        self._init_request(request)
 
         if request.max_new_tokens <= 0:
             self._finish_request(request, reason="max_new_tokens")
@@ -353,6 +416,17 @@ class LLMEngine:
             self._finish_request(request, reason="context_limit")
             yield StreamEvent(kind="done", stop_reason=request.stop_reason)
             return
+
+        if not self._try_reserve_request_capacity(request):
+            self._finish_request(
+                request,
+                reason="capacity_exceeded",
+                error_message="KV cache capacity exceeded",
+            )
+            yield StreamEvent(kind="done", stop_reason=request.stop_reason)
+            return
+
+        self._init_request(request)
 
         try:
             self._run_one_step(request, phase="prefill", emit_text=True)

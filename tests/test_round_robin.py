@@ -147,6 +147,81 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual(result.token_ids, [])
         self.assertEqual(result.text, "")
 
+    def test_capacity_exceeded_rejects_request(self):
+        runtime = FakeRuntime()
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=2,
+            max_kv_cache_tokens=2,
+            num_prefill_workers=1,
+            num_decode_workers=1,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+
+        result = engine.generate_many(["1"], max_new_tokens=2)[0]
+
+        self.assertEqual(result.stop_reason, "capacity_exceeded")
+        self.assertIn("KV cache capacity exceeded", result.error_message or "")
+        self.assertEqual(result.token_ids, [])
+
+    def test_capacity_released_after_finished_request(self):
+        runtime = FakeRuntime()
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=2,
+            max_kv_cache_tokens=3,
+            num_prefill_workers=1,
+            num_decode_workers=1,
+            max_decode_batch_size=1,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+
+        first = engine.generate_many(["1"], max_new_tokens=2)[0]
+        second = engine.generate_many(["2"], max_new_tokens=2)[0]
+
+        self.assertEqual(first.stop_reason, "max_new_tokens")
+        self.assertEqual(second.stop_reason, "max_new_tokens")
+        self.assertEqual(engine.capacity.reserved_tokens, 0)
+
+    def test_capacity_defers_later_request_until_budget_frees(self):
+        runtime = FakeRuntime()
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=2,
+            max_kv_cache_tokens=3,
+            num_prefill_workers=1,
+            num_decode_workers=1,
+            max_decode_batch_size=4,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+
+        results = engine.generate_many(["1", "2"], max_new_tokens=2)
+
+        self.assertEqual([result.stop_reason for result in results], ["max_new_tokens", "max_new_tokens"])
+        self.assertEqual([result.token_ids for result in results], [[11, 21], [12, 22]])
+        self.assertEqual(engine.capacity.reserved_tokens, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
