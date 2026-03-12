@@ -2,7 +2,7 @@ import unittest
 
 try:
     from fastapi.testclient import TestClient
-    from openai_api.app import app
+    from openai_api.app import create_app
     from openai_api.schemas import SUPPORTED_MODEL
     FASTAPI_AVAILABLE = True
 except ModuleNotFoundError:
@@ -36,8 +36,12 @@ class FakeChatService:
 @unittest.skipUnless(FASTAPI_AVAILABLE, "fastapi is not installed")
 class OpenAIChatAPITests(unittest.TestCase):
     def setUp(self):
-        app.state.service = FakeChatService()
-        self.client = TestClient(app)
+        self.app = create_app(service_factory=FakeChatService)
+        self.client_cm = TestClient(self.app)
+        self.client = self.client_cm.__enter__()
+
+    def tearDown(self):
+        self.client_cm.__exit__(None, None, None)
 
     def test_non_stream_response_shape(self):
         response = self.client.post(
@@ -77,6 +81,41 @@ class OpenAIChatAPITests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 422)
+
+    def test_readyz_reports_ready_after_startup(self):
+        response = self.client.get("/readyz")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ready"})
+
+
+@unittest.skipUnless(FASTAPI_AVAILABLE, "fastapi is not installed")
+class OpenAIChatAPIStartupFailureTests(unittest.TestCase):
+    def setUp(self):
+        def failing_service_factory():
+            raise RuntimeError("model init failed")
+
+        self.app = create_app(service_factory=failing_service_factory)
+        self.client_cm = TestClient(self.app)
+        self.client = self.client_cm.__enter__()
+
+    def tearDown(self):
+        self.client_cm.__exit__(None, None, None)
+
+    def test_readyz_reports_startup_failure(self):
+        response = self.client.get("/readyz")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "service unavailable: model init failed")
+
+    def test_chat_completion_fails_fast_when_service_unavailable(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": SUPPORTED_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "service unavailable: model init failed")
 
 
 if __name__ == "__main__":
