@@ -5,9 +5,9 @@ This repository is a clean, minimal PyTorch implementation of Gemma-3-style infe
 ## Purpose
 
 Provide a small, understandable codebase for:
-- decoder-only model inference with KV-cache
-- simple multi-request scheduling
-- an OpenAI-compatible local chat API
+- decoder-only model inference with block-based paged KV cache
+- continuous multi-request scheduling with prefill/decode batching
+- an OpenAI-compatible local chat API with readiness-aware startup
 
 ## Technical Scope
 
@@ -16,8 +16,8 @@ Provide a small, understandable codebase for:
 - Architecture: 18-layer decoder with mixed `sliding_attention` + `full_attention`
 - Attention stack: GQA, RoPE (local/global bases), causal + optional sliding-window mask
 - Normalization/MLP: Gemma-style RMSNorm and gated feedforward (`down(gelu(gate(x)) * up(x))`)
-- Engine: single-device prefill/decode scheduler with round-robin decode and decode-step batching
-- API: FastAPI endpoint compatible with `POST /v1/chat/completions` (streaming + non-streaming)
+- Engine: single-device prefill/decode scheduler with round-robin decode, decode-step batching, and block-based paged KV allocation
+- API: FastAPI app compatible with `POST /v1/chat/completions` plus `GET /healthz` and `GET /readyz`
 
 ## Install
 
@@ -57,33 +57,54 @@ python query_fastapi.py --stream --prompt "Give me one short line about LLM infe
 
 ## Project Structure
 
-- `gemma3/`: model components (attention, RoPE, feedforward, weights mapping)
-- `engine/`: runtime, sampling, and request scheduler
+- `gemma3/`: model components, paged KV storage, RoPE, feedforward, and weights mapping
+- `engine/`: runtime, sampling, block-based KV allocator, and request scheduler
 - `openai_api/`: FastAPI app, schemas, prompting, and chat service
 - `main.py`: direct local generation flow
 - `tests/`: scheduler and API response-shape tests
+
+## Engine Configuration
+
+The scheduler now allocates KV memory in blocks as requests grow, rather than reserving an entire request budget up front.
+
+- `max_kv_cache_tokens`: total KV token budget available to the engine
+- `kv_block_size`: size of each KV allocation block
+- `num_kv_blocks`: optional explicit number of blocks; if omitted, it is derived from `max_kv_cache_tokens // kv_block_size`
+
+This keeps the engine readable while matching the basic vLLM-style idea: admit requests cheaply, grow cache usage incrementally, and free blocks immediately when a request finishes.
+
+## API Operations
+
+- `GET /healthz`: lightweight liveness probe
+- `GET /readyz`: readiness probe; returns `200` only after `ChatCompletionService` has loaded successfully
+- `POST /v1/chat/completions`: returns `503` if service startup failed or is not yet complete
+
+The API now initializes `ChatCompletionService` during app startup, so model load and download failures surface at boot instead of on the first request.
 
 ## Request Flow
 
 ```mermaid
 flowchart TD
     A[Client] --> B[FastAPI app: openai_api/app.py]
-    B --> C{POST /v1/chat/completions}
-    C -->|stream=false| D[create_chat_completion]
-    C -->|stream=true| E[stream_chat_completion]
-    D --> F[messages_to_gemma_prompt]
-    E --> F
-    F --> G[LLMEngine.generate_many / generate_stream]
-    G --> H[_build_request -> _init_request]
-    H --> I[prefill: _run_one_step]
-    I --> J[model forward use_cache=True]
-    J --> K[sample_next_token + repetition penalty]
-    K --> L{stop? eos / max_new_tokens / context_limit}
-    L -->|no| M[decode: _select_decode_batch + _run_decode_batch]
-    M --> J
-    L -->|yes| N[result]
-    N -->|non-stream| O[JSON chat.completion]
-    N -->|stream| P["SSE chat.completion.chunk + [DONE]"]
+    B --> C[startup: build ChatCompletionService]
+    B --> D[GET /healthz]
+    B --> E[GET /readyz]
+    B --> F{POST /v1/chat/completions}
+    F -->|stream=false| G[create_chat_completion]
+    F -->|stream=true| H[stream_chat_completion]
+    G --> I[messages_to_gemma_prompt]
+    H --> I
+    I --> J[LLMEngine.generate_many / generate_stream]
+    J --> K[_build_request -> _init_request]
+    K --> L[prefill: allocate KV blocks and run one step]
+    L --> M[model forward with shared paged KV caches]
+    M --> N[sample_next_token + repetition penalty]
+    N --> O{stop? eos / max_new_tokens / context_limit / capacity}
+    O -->|no| P[decode: select cohort, grow block tables, run batched decode]
+    P --> M
+    O -->|yes| Q[release KV blocks and build result]
+    Q -->|non-stream| R[JSON chat.completion]
+    Q -->|stream| S["SSE chat.completion.chunk + [DONE]"]
 ```
 
 ## Validation
@@ -91,6 +112,8 @@ flowchart TD
 ```bash
 python -m unittest discover -s tests -q
 ```
+
+Scheduler tests cover round-robin decode ordering, paged KV isolation between requests, and block-capacity reuse / deferral.
 
 Real `LLMEngine` regression tests (uses actual model/runtime, opt-in):
 
