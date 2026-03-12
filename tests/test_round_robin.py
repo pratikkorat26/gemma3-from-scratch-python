@@ -1,4 +1,5 @@
 import unittest
+from typing import Optional
 
 import torch
 import sys
@@ -12,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from engine.config import EngineConfig, SamplingConfig
 from engine.scheduler import LLMEngine
 from engine.types import RequestState
+from gemma3.paged_kv import PagedKVCache
 
 
 class FakeTokenizer:
@@ -24,71 +26,81 @@ class FakeTokenizer:
         return "".join(f"<{token_id}>" for token_id in ids)
 
 
-class FakeModel:
+class FakePagedModel:
     def __init__(self, fail_on_token=None):
         self.context_length = 1024
         self.fail_on_token = fail_on_token
         self.call_last_tokens = []
 
-    def __call__(self, input_ids, past_kv=None, use_cache=True):
-        batch_size = int(input_ids.shape[0])
+    def init_paged_kv_caches(self, *, num_blocks, block_size, device):
+        return [
+            PagedKVCache.empty(
+                num_blocks=num_blocks,
+                num_kv_groups=1,
+                block_size=block_size,
+                head_dim=1,
+                device=device,
+                dtype=torch.float32,
+            )
+        ]
+
+    def __call__(
+        self,
+        input_ids,
+        *,
+        block_tables=None,
+        kv_lens=None,
+        paged_kv_caches=None,
+        past_kv=None,
+        use_cache=True,
+    ):
+        if block_tables is None or kv_lens is None or paged_kv_caches is None:
+            raise RuntimeError("paged KV inputs are required")
+
+        cache = paged_kv_caches[0]
+        batch_size, seq_len = input_ids.shape
         last_tokens = [int(input_ids[idx, -1].item()) for idx in range(batch_size)]
         self.call_last_tokens.extend(last_tokens)
         for last_token in last_tokens:
             if self.fail_on_token is not None and last_token == self.fail_on_token:
                 raise RuntimeError(f"forced failure on token {last_token}")
 
-        vocab_size = 2048
-        logits = torch.full((batch_size, input_ids.shape[1], vocab_size), -1e9)
-        cache_values = torch.zeros((batch_size, 1, 1, 1), dtype=torch.float32)
-        for idx, last_token in enumerate(last_tokens):
-            next_token = last_token + 10
-            logits[idx, -1, next_token] = 0.0
-            cache_values[idx, 0, 0, 0] = float(last_token)
-        next_cache = [(cache_values, cache_values.clone())]
-        return logits, next_cache
-
-
-class FakeModelWithStrictCacheIsolation:
-    def __init__(self):
-        self.context_length = 1024
-
-    def __call__(self, input_ids, past_kv=None, use_cache=True):
-        batch_size = int(input_ids.shape[0])
         vocab_size = 4096
-        logits = torch.full((batch_size, input_ids.shape[1], vocab_size), -1e9)
-        cache_values = torch.zeros((batch_size, 1, 1, 1), dtype=torch.float32)
-
-        for idx in range(batch_size):
-            current_token = int(input_ids[idx, -1].item())
-            if past_kv is not None:
-                cache_signature = int(past_kv[0][0][idx, 0, 0, 0].item())
-                expected_signature = current_token - 1
-                if cache_signature != expected_signature:
+        logits = torch.full((batch_size, seq_len, vocab_size), -1e9)
+        for batch_idx in range(batch_size):
+            current_token = int(input_ids[batch_idx, -1].item())
+            kv_len = int(kv_lens[batch_idx].item())
+            if kv_len > 0:
+                prev_pos = kv_len - 1
+                prev_block = int(block_tables[batch_idx, prev_pos // cache.block_size].item())
+                prev_offset = prev_pos % cache.block_size
+                prev_token = int(cache.k_blocks[prev_block, 0, prev_offset, 0].item())
+                expected_prev_token = current_token - 10
+                if prev_token != expected_prev_token:
                     raise RuntimeError(
-                        f"KV cache leakage detected: cache={cache_signature}, expected={expected_signature}"
+                        f"KV cache leakage detected: cache={prev_token}, expected={expected_prev_token}"
                     )
 
-            next_token = current_token + 1
-            logits[idx, -1, next_token] = 0.0
-            cache_values[idx, 0, 0, 0] = float(current_token)
+            for token_offset in range(seq_len):
+                token = int(input_ids[batch_idx, token_offset].item())
+                pos = kv_len + token_offset
+                block_id = int(block_tables[batch_idx, pos // cache.block_size].item())
+                if block_id < 0:
+                    raise RuntimeError("missing paged KV block assignment")
+                block_offset = pos % cache.block_size
+                cache.k_blocks[block_id, 0, block_offset, 0] = float(token)
+                cache.v_blocks[block_id, 0, block_offset, 0] = float(token)
 
-        next_cache = [(cache_values, cache_values.clone())]
-        return logits, next_cache
+            next_token = current_token + 10
+            logits[batch_idx, -1, next_token] = 0.0
+        return logits
 
 
 class FakeRuntime:
     def __init__(self, fail_on_token=None):
         self.device = torch.device("cpu")
         self.tokenizer = FakeTokenizer()
-        self.model = FakeModel(fail_on_token=fail_on_token)
-
-
-class FakeRuntimeStrictCache:
-    def __init__(self):
-        self.device = torch.device("cpu")
-        self.tokenizer = FakeTokenizer()
-        self.model = FakeModelWithStrictCacheIsolation()
+        self.model = FakePagedModel(fail_on_token=fail_on_token)
 
 
 class RoundRobinSchedulerTests(unittest.TestCase):
@@ -99,6 +111,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
             max_new_tokens=2,
             num_prefill_workers=1,
             num_decode_workers=1,
+            kv_block_size=1,
             sampling=SamplingConfig(
                 temperature=0.0,
                 top_p=1.0,
@@ -112,7 +125,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         request_id: int,
         *,
         token_length: int,
-        sampling: SamplingConfig | None = None,
+        sampling: Optional[SamplingConfig] = None,
     ) -> RequestState:
         request = RequestState.from_prompt(
             request_id=request_id,
@@ -148,7 +161,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual(results[2].stop_reason, "max_new_tokens")
 
     def test_kv_cache_isolation_between_requests(self):
-        runtime = FakeRuntimeStrictCache()
+        runtime = FakeRuntime()
         engine = LLMEngine(runtime=runtime, config=self.config)
 
         results = engine.generate_many(["100", "200", "300"])
@@ -173,7 +186,9 @@ class RoundRobinSchedulerTests(unittest.TestCase):
             choose_model="270m",
             use_instruct_model=False,
             max_new_tokens=2,
-            max_kv_cache_tokens=2,
+            max_kv_cache_tokens=1,
+            kv_block_size=1,
+            num_kv_blocks=1,
             num_prefill_workers=1,
             num_decode_workers=1,
             sampling=SamplingConfig(
@@ -189,7 +204,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
 
         self.assertEqual(result.stop_reason, "capacity_exceeded")
         self.assertIn("KV cache capacity exceeded", result.error_message or "")
-        self.assertEqual(result.token_ids, [])
+        self.assertEqual(result.token_ids, [11])
 
     def test_capacity_released_after_finished_request(self):
         runtime = FakeRuntime()
@@ -198,6 +213,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
             use_instruct_model=False,
             max_new_tokens=2,
             max_kv_cache_tokens=3,
+            kv_block_size=1,
             num_prefill_workers=1,
             num_decode_workers=1,
             max_decode_batch_size=1,
@@ -224,6 +240,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
             use_instruct_model=False,
             max_new_tokens=2,
             max_kv_cache_tokens=3,
+            kv_block_size=1,
             num_prefill_workers=1,
             num_decode_workers=1,
             max_decode_batch_size=4,
@@ -247,6 +264,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         config = EngineConfig(
             choose_model="270m",
             use_instruct_model=False,
+            kv_block_size=1,
             max_decode_batch_size=2,
             decode_selection_window=4,
         )
@@ -270,6 +288,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         config = EngineConfig(
             choose_model="270m",
             use_instruct_model=False,
+            kv_block_size=1,
             max_decode_batch_size=2,
             decode_selection_window=4,
         )
@@ -293,6 +312,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         config = EngineConfig(
             choose_model="270m",
             use_instruct_model=False,
+            kv_block_size=1,
             max_decode_batch_size=2,
             decode_selection_window=4,
         )

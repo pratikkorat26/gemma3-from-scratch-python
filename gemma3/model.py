@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 from gemma3.attention import RMSNorm, GroupedQueryAttention
 from gemma3.feedforward import FeedForward
+from gemma3.paged_kv import PagedKVCache
 from gemma3.rope import RotaryEmbedding
 
 
@@ -86,9 +87,19 @@ class TransformerBlock(nn.Module):
         *,
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        block_tables: Optional[torch.Tensor] = None,
+        kv_lens: Optional[torch.Tensor] = None,
+        paged_kv_cache: Optional[PagedKVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         h = self.input_layernorm(x)
-        att_out, next_kv = self.att(h, past_kv=past_kv, use_cache=use_cache)
+        att_out, next_kv = self.att(
+            h,
+            past_kv=past_kv,
+            use_cache=use_cache,
+            block_tables=block_tables,
+            kv_lens=kv_lens,
+            paged_kv_cache=paged_kv_cache,
+        )
         x = x + self.post_attention_layernorm(att_out)
 
         h = self.pre_feedforward_layernorm(x)
@@ -159,6 +170,29 @@ class Gemma3Model(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.final_norm = RMSNorm(emb_dim)
         self.out_head = nn.Linear(emb_dim, vocab_size, bias=False, dtype=dtype)
+        self.num_kv_groups = n_kv_groups
+        self.head_dim = head_dim
+        self.dtype = dtype or self.out_head.weight.dtype
+
+    def init_paged_kv_caches(
+        self,
+        *,
+        num_blocks: int,
+        block_size: int,
+        device: Optional[torch.device] = None,
+    ) -> List[PagedKVCache]:
+        cache_device = device or self.tok_emb.weight.device
+        return [
+            PagedKVCache.empty(
+                num_blocks=num_blocks,
+                num_kv_groups=self.num_kv_groups,
+                block_size=block_size,
+                head_dim=self.head_dim,
+                device=cache_device,
+                dtype=self.dtype,
+            )
+            for _ in self.blocks
+        ]
 
     def forward(
         self,
@@ -166,6 +200,9 @@ class Gemma3Model(nn.Module):
         *,
         past_kv: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         use_cache: bool = False,
+        block_tables: Optional[torch.Tensor] = None,
+        kv_lens: Optional[torch.Tensor] = None,
+        paged_kv_caches: Optional[List[PagedKVCache]] = None,
     ):
         if input_ids.ndim != 2:
             raise ValueError("input_ids must be [B, T]")
@@ -174,13 +211,25 @@ class Gemma3Model(nn.Module):
 
         if past_kv is not None and len(past_kv) != len(self.blocks):
             raise ValueError("past_kv must have one entry per transformer block")
+        if paged_kv_caches is not None and len(paged_kv_caches) != len(self.blocks):
+            raise ValueError("paged_kv_caches must have one entry per transformer block")
+        if paged_kv_caches is not None and (block_tables is None or kv_lens is None):
+            raise ValueError("block_tables and kv_lens are required with paged_kv_caches")
 
         x = self.tok_emb(input_ids) * self.embed_scale
 
         next_cache: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
         for i, block in enumerate(self.blocks):
             layer_past = past_kv[i] if past_kv is not None else None
-            x, layer_kv = block(x, past_kv=layer_past, use_cache=use_cache)
+            layer_cache = paged_kv_caches[i] if paged_kv_caches is not None else None
+            x, layer_kv = block(
+                x,
+                past_kv=layer_past,
+                use_cache=use_cache,
+                block_tables=block_tables,
+                kv_lens=kv_lens,
+                paged_kv_cache=layer_cache,
+            )
             if use_cache:
                 next_cache.append(layer_kv)
 

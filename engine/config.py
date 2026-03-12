@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -20,3 +21,5 @@ class EngineConfig:
     max_decode_batch_size: int = 4
     decode_selection_window: int = 8
     max_kv_cache_tokens: int = 32_768
+    kv_block_size: int = 16
+    num_kv_blocks: Optional[int] = None

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 from gemma3.rope import apply_rope_single
+from gemma3.paged_kv import PagedKVCache
 
 class RMSNorm(nn.Module):
     """
@@ -154,11 +155,141 @@ class GroupedQueryAttention(nn.Module):
                 f"got {tuple(past_k.shape)}"
             )
 
+    def _append_to_paged_cache(
+        self,
+        *,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_lens: torch.Tensor,
+        paged_kv_cache: PagedKVCache,
+    ) -> None:
+        _, _, q_len, _ = k_new.shape
+        block_size = paged_kv_cache.block_size
+        for batch_idx in range(k_new.shape[0]):
+            start_pos = int(kv_lens[batch_idx].item())
+            for token_offset in range(q_len):
+                position = start_pos + token_offset
+                block_slot = position // block_size
+                block_offset = position % block_size
+                block_id = int(block_tables[batch_idx, block_slot].item())
+                if block_id < 0:
+                    raise ValueError("paged KV block table is missing an assigned block")
+                paged_kv_cache.k_blocks[block_id, :, block_offset, :] = k_new[batch_idx, :, token_offset, :]
+                paged_kv_cache.v_blocks[block_id, :, block_offset, :] = v_new[batch_idx, :, token_offset, :]
+
+    def _gather_sequence_kv(
+        self,
+        *,
+        block_table: torch.Tensor,
+        seq_len: int,
+        paged_kv_cache: PagedKVCache,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        block_size = paged_kv_cache.block_size
+        needed_blocks = (seq_len + block_size - 1) // block_size
+        block_ids = block_table[:needed_blocks]
+        valid_block_ids = block_ids[block_ids >= 0]
+        if valid_block_ids.numel() != needed_blocks:
+            raise ValueError("paged KV block table does not cover the active sequence")
+
+        k_chunks = paged_kv_cache.k_blocks[valid_block_ids]
+        v_chunks = paged_kv_cache.v_blocks[valid_block_ids]
+        k_seq = k_chunks.permute(1, 0, 2, 3).reshape(
+            self.num_kv_groups,
+            needed_blocks * block_size,
+            self.head_dim,
+        )
+        v_seq = v_chunks.permute(1, 0, 2, 3).reshape(
+            self.num_kv_groups,
+            needed_blocks * block_size,
+            self.head_dim,
+        )
+        return k_seq[:, :seq_len, :], v_seq[:, :seq_len, :]
+
+    def _forward_paged(
+        self,
+        x: torch.Tensor,
+        *,
+        block_tables: torch.Tensor,
+        kv_lens: torch.Tensor,
+        paged_kv_cache: PagedKVCache,
+    ) -> torch.Tensor:
+        batch_size, q_len, _ = x.shape
+        device = x.device
+
+        q = self.q_proj(x).view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, q_len, self.num_kv_groups, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, q_len, self.num_kv_groups, self.head_dim).transpose(1, 2)
+
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        if self.rope is not None:
+            q_rope = []
+            k_rope = []
+            for batch_idx in range(batch_size):
+                offset = int(kv_lens[batch_idx].item())
+                cos, sin = self.rope.get_cos_sin(seq_len=q_len, offset=offset, device=device, dtype=x.dtype)
+                q_rope.append(apply_rope_single(q[batch_idx : batch_idx + 1], cos, sin))
+                k_rope.append(apply_rope_single(k[batch_idx : batch_idx + 1], cos, sin))
+            q = torch.cat(q_rope, dim=0)
+            k = torch.cat(k_rope, dim=0)
+
+        self._append_to_paged_cache(
+            k_new=k,
+            v_new=v,
+            block_tables=block_tables,
+            kv_lens=kv_lens,
+            paged_kv_cache=paged_kv_cache,
+        )
+
+        outputs = []
+        for batch_idx in range(batch_size):
+            seq_len = int(kv_lens[batch_idx].item()) + q_len
+            k_seq, v_seq = self._gather_sequence_kv(
+                block_table=block_tables[batch_idx],
+                seq_len=seq_len,
+                paged_kv_cache=paged_kv_cache,
+            )
+
+            q_batch = q[batch_idx : batch_idx + 1]
+            k_batch = k_seq.unsqueeze(0)
+            v_batch = v_seq.unsqueeze(0)
+
+            q_batch = q_batch.reshape(1, self.num_kv_groups, self.group_size, q_len, self.head_dim)
+            q_batch = q_batch.reshape(self.group_size, self.num_kv_groups, q_len, self.head_dim)
+
+            k_batch = k_batch.unsqueeze(1).expand(1, self.group_size, -1, -1, -1)
+            v_batch = v_batch.unsqueeze(1).expand(1, self.group_size, -1, -1, -1)
+            k_batch = k_batch.reshape(self.group_size, self.num_kv_groups, seq_len, self.head_dim)
+            v_batch = v_batch.reshape(self.group_size, self.num_kv_groups, seq_len, self.head_dim)
+
+            attn_mask = self._build_attn_mask(q_len, seq_len, device=device, dtype=q_batch.dtype)
+            out_batch = F.scaled_dot_product_attention(
+                q_batch,
+                k_batch,
+                v_batch,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=self.scale,
+            )
+            out_batch = out_batch.reshape(1, self.group_size, self.num_kv_groups, q_len, self.head_dim)
+            out_batch = out_batch.reshape(1, self.num_heads, q_len, self.head_dim)
+            out_batch = out_batch.transpose(1, 2).reshape(1, q_len, self.num_heads * self.head_dim)
+            outputs.append(out_batch)
+
+        out = torch.cat(outputs, dim=0)
+        return self.out_proj(out)
+
     def forward(
         self,
         x: torch.Tensor,
         past_kv: Optional[tuple] = None,
         use_cache: bool = False,
+        block_tables: Optional[torch.Tensor] = None,
+        kv_lens: Optional[torch.Tensor] = None,
+        paged_kv_cache: Optional[PagedKVCache] = None,
     ):
         """
         Inputs:
@@ -173,6 +304,16 @@ class GroupedQueryAttention(nn.Module):
                    k: [B, G, S, Hd]
                    v: [B, G, S, Hd]
         """
+        if paged_kv_cache is not None:
+            if block_tables is None or kv_lens is None:
+                raise ValueError("block_tables and kv_lens are required for paged KV attention")
+            return self._forward_paged(
+                x,
+                block_tables=block_tables,
+                kv_lens=kv_lens,
+                paged_kv_cache=paged_kv_cache,
+            ), None
+
         B, T, _ = x.shape
         device = x.device
 

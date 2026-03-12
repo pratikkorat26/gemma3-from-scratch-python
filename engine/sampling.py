@@ -1,11 +1,11 @@
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, Union
 
 import torch
 
 
 def apply_repetition_penalty_(
     logits: torch.Tensor,
-    all_token_ids: torch.Tensor | Sequence[Iterable[int]],
+    all_token_ids: Union[torch.Tensor, Sequence[Iterable[int]]],
     penalty: Optional[float],
 ) -> torch.Tensor:
     if penalty is None or penalty <= 1.0:

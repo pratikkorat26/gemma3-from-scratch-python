@@ -10,29 +10,65 @@ from .sampling import apply_repetition_penalty_, sample_next_token
 from .types import GenerationResult, RequestState, StreamEvent
 
 
-class KVCapacityManager:
-    def __init__(self, max_kv_cache_tokens: int):
+class KVBlockManager:
+    def __init__(
+        self,
+        *,
+        max_kv_cache_tokens: int,
+        block_size: int,
+        num_blocks: Optional[int] = None,
+    ):
         if max_kv_cache_tokens <= 0:
             raise ValueError("max_kv_cache_tokens must be > 0")
+        if block_size <= 0:
+            raise ValueError("kv_block_size must be > 0")
+
+        derived_blocks = max_kv_cache_tokens // block_size
+        if num_blocks is None:
+            num_blocks = derived_blocks
+        if num_blocks <= 0:
+            raise ValueError("num_kv_blocks must be > 0")
+
         self.max_kv_cache_tokens = int(max_kv_cache_tokens)
-        self._reserved_tokens = 0
+        self.block_size = int(block_size)
+        self.num_blocks = int(num_blocks)
+        self._free_block_ids: Deque[int] = deque(range(self.num_blocks))
+        self._allocated_blocks = 0
 
     @property
     def reserved_tokens(self) -> int:
-        return self._reserved_tokens
+        return self._allocated_blocks * self.block_size
 
-    def can_reserve(self, token_count: int) -> bool:
-        return token_count >= 0 and (self._reserved_tokens + token_count) <= self.max_kv_cache_tokens
-
-    def reserve(self, token_count: int) -> None:
-        if not self.can_reserve(token_count):
-            raise ValueError("KV cache capacity exceeded")
-        self._reserved_tokens += token_count
-
-    def release(self, token_count: int) -> None:
+    def _required_blocks(self, token_count: int) -> int:
         if token_count <= 0:
+            return 0
+        return (int(token_count) + self.block_size - 1) // self.block_size
+
+    def can_allocate_for(self, request: RequestState, total_tokens: int) -> bool:
+        required_blocks = self._required_blocks(total_tokens)
+        additional_blocks = required_blocks - len(request.block_table)
+        return additional_blocks <= len(self._free_block_ids)
+
+    def ensure_capacity(self, request: RequestState, total_tokens: int) -> bool:
+        required_blocks = self._required_blocks(total_tokens)
+        additional_blocks = required_blocks - len(request.block_table)
+        if additional_blocks <= 0:
+            return True
+        if additional_blocks > len(self._free_block_ids):
+            return False
+
+        for _ in range(additional_blocks):
+            request.block_table.append(self._free_block_ids.popleft())
+        self._allocated_blocks += additional_blocks
+        return True
+
+    def release(self, request: RequestState) -> None:
+        if not request.block_table:
             return
-        self._reserved_tokens = max(0, self._reserved_tokens - token_count)
+        for block_id in request.block_table:
+            self._free_block_ids.append(block_id)
+        self._allocated_blocks = max(0, self._allocated_blocks - len(request.block_table))
+        request.block_table.clear()
 
 
 class LLMEngine:
@@ -46,7 +82,16 @@ class LLMEngine:
     def __init__(self, runtime: GemmaRuntime, config: EngineConfig):
         self.runtime = runtime
         self.config = config
-        self.capacity = KVCapacityManager(max_kv_cache_tokens=self.config.max_kv_cache_tokens)
+        self.capacity = KVBlockManager(
+            max_kv_cache_tokens=self.config.max_kv_cache_tokens,
+            block_size=self.config.kv_block_size,
+            num_blocks=self.config.num_kv_blocks,
+        )
+        self.paged_kv_caches = self.runtime.model.init_paged_kv_caches(
+            num_blocks=self.capacity.num_blocks,
+            block_size=self.capacity.block_size,
+            device=self.runtime.device,
+        )
 
     def _encode_prompt(self, prompt: str) -> List[int]:
         if self.config.use_instruct_model:
@@ -77,25 +122,8 @@ class LLMEngine:
     def _context_limit(self) -> int:
         return int(self.runtime.model.context_length)
 
-    def _estimate_kv_cache_tokens(self, request: RequestState) -> int:
-        requested_total = len(request.prompt_token_ids) + max(0, int(request.max_new_tokens))
-        return min(self._context_limit(), requested_total)
-
-    def _try_reserve_request_capacity(self, request: RequestState) -> bool:
-        if request.reserved_kv_cache_tokens > 0 and not request.kv_cache_released:
-            return True
-        request.reserved_kv_cache_tokens = self._estimate_kv_cache_tokens(request)
-        request.kv_cache_released = False
-        if not self.capacity.can_reserve(request.reserved_kv_cache_tokens):
-            return False
-        self.capacity.reserve(request.reserved_kv_cache_tokens)
-        return True
-
     def _release_request_capacity(self, request: RequestState) -> None:
-        if request.kv_cache_released:
-            return
-        self.capacity.release(request.reserved_kv_cache_tokens)
-        request.kv_cache_released = True
+        self.capacity.release(request)
 
     def _finish_request(self, request: RequestState, reason: str, error_message: Optional[str] = None) -> None:
         request.status = "finished" if reason != "error" else "error"
@@ -113,7 +141,9 @@ class LLMEngine:
         request.seen_token_ids = set(request.prompt_token_ids)
         request.text_chunks = []
         request.past_kv = None
-        request.kv_cache_released = False
+        request.block_table = []
+        request.num_computed_tokens = 0
+        request.live_kv_tokens = 0
         request.stop_reason = None
         request.error_message = None
         request.prefill_time_s = 0.0
@@ -154,26 +184,91 @@ class LLMEngine:
             decode_steps=request.decode_steps,
         )
 
-    def _decode_step(self, request: RequestState) -> torch.Tensor:
-        assert request.current_input is not None
+    def _build_block_tables(self, requests: List[RequestState]) -> torch.Tensor:
+        max_blocks = max(len(request.block_table) for request in requests)
+        block_tables = torch.full(
+            (len(requests), max_blocks),
+            fill_value=-1,
+            dtype=torch.long,
+            device=self.runtime.device,
+        )
+        for row_idx, request in enumerate(requests):
+            if request.block_table:
+                block_tables[row_idx, : len(request.block_table)] = torch.tensor(
+                    request.block_table,
+                    dtype=torch.long,
+                    device=self.runtime.device,
+                )
+        return block_tables
+
+    def _prepare_paged_batch(
+        self,
+        requests: List[RequestState],
+        *,
+        defer_on_capacity: bool,
+    ) -> tuple[List[RequestState], List[RequestState]]:
+        eligible: List[RequestState] = []
+        blocked: List[RequestState] = []
+        for request in requests:
+            if request.current_input is None:
+                self._finish_request(request, reason="error", error_message="request tensors are not initialized")
+                continue
+            if len(request.all_token_ids) >= self._context_limit():
+                self._finish_request(request, reason="context_limit")
+                continue
+            target_tokens = request.live_kv_tokens + int(request.current_input.shape[1])
+            if not self.capacity.ensure_capacity(request, target_tokens):
+                if defer_on_capacity:
+                    blocked.append(request)
+                else:
+                    self._finish_request(
+                        request,
+                        reason="capacity_exceeded",
+                        error_message="KV cache capacity exceeded",
+                    )
+                continue
+            eligible.append(request)
+        return eligible, blocked
+
+    def _sample_next_tokens(self, logits: torch.Tensor, requests: List[RequestState]) -> torch.Tensor:
+        next_logits = logits[:, -1, :]
+        next_logits = apply_repetition_penalty_(
+            next_logits,
+            [request.seen_token_ids for request in requests],
+            penalty=requests[0].sampling.repetition_penalty,
+        )
+        return sample_next_token(
+            next_logits,
+            temperature=requests[0].sampling.temperature,
+            top_p=requests[0].sampling.top_p,
+            top_k=requests[0].sampling.top_k,
+        )
+
+    def _forward_paged_batch(self, requests: List[RequestState]) -> torch.Tensor:
+        eligible, _ = self._prepare_paged_batch(requests, defer_on_capacity=False)
+        if not eligible:
+            return torch.empty(0, 1, 0, device=self.runtime.device)
+
+        current_input = torch.cat([request.current_input for request in eligible], dim=0)
+        block_tables = self._build_block_tables(eligible)
+        kv_lens = torch.tensor(
+            [request.live_kv_tokens for request in eligible],
+            dtype=torch.long,
+            device=self.runtime.device,
+        )
+
         with torch.inference_mode():
-            logits, request.past_kv = self.runtime.model(
-                request.current_input,
-                past_kv=request.past_kv,
-                use_cache=True,
+            logits = self.runtime.model(
+                current_input,
+                block_tables=block_tables,
+                kv_lens=kv_lens,
+                paged_kv_caches=self.paged_kv_caches,
             )
-            next_logits = logits[:, -1, :]
-            next_logits = apply_repetition_penalty_(
-                next_logits,
-                [request.seen_token_ids],
-                penalty=request.sampling.repetition_penalty,
-            )
-            return sample_next_token(
-                next_logits,
-                temperature=request.sampling.temperature,
-                top_p=request.sampling.top_p,
-                top_k=request.sampling.top_k,
-            )
+
+        for request in eligible:
+            request.live_kv_tokens += int(request.current_input.shape[1])
+            request.num_computed_tokens = request.live_kv_tokens
+        return logits
 
     def _record_next_token(self, request: RequestState, next_token: torch.Tensor, *, emit_text: bool) -> None:
         next_id = int(next_token.item())
@@ -201,15 +296,18 @@ class LLMEngine:
             return
 
         started = time.perf_counter()
-        next_token = self._decode_step(request)
+        logits = self._forward_paged_batch([request])
+        if request.status in ("finished", "error"):
+            return
+
+        next_token = self._sample_next_tokens(logits, [request])
         elapsed = time.perf_counter() - started
 
         if phase == "prefill":
             request.prefill_time_s += elapsed
-            request.decode_steps += 1
         else:
             request.decode_time_s += elapsed
-            request.decode_steps += 1
+        request.decode_steps += 1
 
         self._record_next_token(request, next_token, emit_text=emit_text)
 
@@ -254,65 +352,43 @@ class LLMEngine:
         return batch
 
     def _run_decode_batch(self, batch: List[RequestState]) -> None:
-        eligible: List[RequestState] = []
-        for request in batch:
-            if request.current_input is None:
-                self._finish_request(request, reason="error", error_message="request tensors are not initialized")
-                continue
-            if len(request.all_token_ids) >= self._context_limit():
-                self._finish_request(request, reason="context_limit")
-                continue
-            eligible.append(request)
-
+        eligible, blocked = self._prepare_paged_batch(batch, defer_on_capacity=True)
+        if not eligible and blocked:
+            self._finish_request(
+                blocked[0],
+                reason="capacity_exceeded",
+                error_message="KV cache capacity exceeded",
+            )
+            return
         if not eligible:
             return
 
         current_input = torch.cat([request.current_input for request in eligible], dim=0)
-
-        layer_count = len(eligible[0].past_kv) if eligible[0].past_kv is not None else 0
-        if layer_count == 0:
-            # Decode batching is used only after prefill populated the cache.
-            for request in eligible:
-                self._run_one_step(request, phase="decode")
-            return
-
-        merged_past = []
-        for layer_idx in range(layer_count):
-            merged_k = torch.cat([request.past_kv[layer_idx][0] for request in eligible], dim=0)
-            merged_v = torch.cat([request.past_kv[layer_idx][1] for request in eligible], dim=0)
-            merged_past.append((merged_k, merged_v))
+        block_tables = self._build_block_tables(eligible)
+        kv_lens = torch.tensor(
+            [request.live_kv_tokens for request in eligible],
+            dtype=torch.long,
+            device=self.runtime.device,
+        )
 
         started = time.perf_counter()
         with torch.inference_mode():
-            logits, merged_next = self.runtime.model(current_input, past_kv=merged_past, use_cache=True)
-            next_logits = logits[:, -1, :]
-            next_logits = apply_repetition_penalty_(
-                next_logits,
-                [request.seen_token_ids for request in eligible],
-                penalty=eligible[0].sampling.repetition_penalty,
+            logits = self.runtime.model(
+                current_input,
+                block_tables=block_tables,
+                kv_lens=kv_lens,
+                paged_kv_caches=self.paged_kv_caches,
             )
-            next_tokens = sample_next_token(
-                next_logits,
-                temperature=eligible[0].sampling.temperature,
-                top_p=eligible[0].sampling.top_p,
-                top_k=eligible[0].sampling.top_k,
-            )
+            next_tokens = self._sample_next_tokens(logits, eligible)
         elapsed = time.perf_counter() - started
         per_request_elapsed = elapsed / len(eligible)
 
         for batch_idx, request in enumerate(eligible):
-            request.past_kv = [
-                (
-                    layer_k[batch_idx : batch_idx + 1],
-                    layer_v[batch_idx : batch_idx + 1],
-                )
-                for (layer_k, layer_v) in merged_next
-            ]
+            request.live_kv_tokens += int(request.current_input.shape[1])
+            request.num_computed_tokens = request.live_kv_tokens
             request.decode_time_s += per_request_elapsed
             request.decode_steps += 1
-
-            next_token = next_tokens[batch_idx : batch_idx + 1]
-            self._record_next_token(request, next_token, emit_text=False)
+            self._record_next_token(request, next_tokens[batch_idx : batch_idx + 1], emit_text=False)
 
     def generate_many(
         self,
@@ -351,15 +427,9 @@ class LLMEngine:
                         self._finish_request(request, reason="max_new_tokens")
                     elif len(request.prompt_token_ids) >= self._context_limit():
                         self._finish_request(request, reason="context_limit")
-                    elif self._estimate_kv_cache_tokens(request) > self.capacity.max_kv_cache_tokens:
-                        self._finish_request(
-                            request,
-                            reason="capacity_exceeded",
-                            error_message="KV cache capacity exceeded",
-                        )
                     else:
                         if request.first_scheduled_at_s is None:
-                            if not self._try_reserve_request_capacity(request):
+                            if not self.capacity.can_allocate_for(request, len(request.prompt_token_ids)):
                                 prefill_queue.append(request)
                                 if decode_queue:
                                     continue
@@ -391,11 +461,7 @@ class LLMEngine:
                     for request in batch:
                         if request.status in ("finished", "error"):
                             continue
-                        try:
-                            request.phase = "decode"
-                            self._run_one_step(request, phase="decode")
-                        except Exception as single_exc:
-                            self._finish_request(request, reason="error", error_message=str(single_exc))
+                        self._finish_request(request, reason="error", error_message=str(exc))
 
                 for request in batch:
                     if request.status in ("finished", "error"):
@@ -431,7 +497,7 @@ class LLMEngine:
             yield StreamEvent(kind="done", stop_reason=request.stop_reason)
             return
 
-        if not self._try_reserve_request_capacity(request):
+        if not self.capacity.can_allocate_for(request, len(request.prompt_token_ids)):
             self._finish_request(
                 request,
                 reason="capacity_exceeded",
