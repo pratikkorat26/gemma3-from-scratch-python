@@ -222,21 +222,35 @@ class LLMEngine:
         )
 
     def _select_decode_batch(self, decode_queue: Deque[RequestState]) -> List[RequestState]:
-        first = decode_queue.popleft()
-        batch = [first]
         max_batch = max(1, int(self.config.max_decode_batch_size))
+        selection_window = max(max_batch, int(self.config.decode_selection_window))
 
-        target_len = len(first.all_token_ids)
-        target_sampling = self._sampling_key(first)
-        remaining = len(decode_queue)
-        for _ in range(remaining):
-            candidate = decode_queue.popleft()
-            candidate_len = len(candidate.all_token_ids)
-            candidate_sampling = self._sampling_key(candidate)
-            if len(batch) < max_batch and candidate_len == target_len and candidate_sampling == target_sampling:
-                batch.append(candidate)
-            else:
-                decode_queue.append(candidate)
+        window: List[RequestState] = []
+        while decode_queue and len(window) < selection_window:
+            window.append(decode_queue.popleft())
+
+        cohorts: Dict[tuple, List[int]] = {}
+        for idx, request in enumerate(window):
+            cohort_key = (len(request.all_token_ids), self._sampling_key(request))
+            cohorts.setdefault(cohort_key, []).append(idx)
+
+        best_indices: List[int] = []
+        best_first_idx = len(window)
+        for indices in cohorts.values():
+            if len(indices) > len(best_indices):
+                best_indices = indices
+                best_first_idx = indices[0]
+                continue
+            if len(indices) == len(best_indices) and indices and indices[0] < best_first_idx:
+                best_indices = indices
+                best_first_idx = indices[0]
+
+        selected_positions = set(best_indices[:max_batch])
+        batch = [request for idx, request in enumerate(window) if idx in selected_positions]
+        remaining = [request for idx, request in enumerate(window) if idx not in selected_positions]
+
+        for request in reversed(remaining):
+            decode_queue.appendleft(request)
         return batch
 
     def _run_decode_batch(self, batch: List[RequestState]) -> None:

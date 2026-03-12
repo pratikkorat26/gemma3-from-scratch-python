@@ -18,4 +18,5 @@ class EngineConfig:
     num_prefill_workers: int = 1
     num_decode_workers: int = 1
     max_decode_batch_size: int = 4
+    decode_selection_window: int = 8
     max_kv_cache_tokens: int = 32_768

@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import sys
+from collections import deque
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from engine.config import EngineConfig, SamplingConfig
 from engine.scheduler import LLMEngine
+from engine.types import RequestState
 
 
 class FakeTokenizer:
@@ -104,6 +106,24 @@ class RoundRobinSchedulerTests(unittest.TestCase):
                 repetition_penalty=1.0,
             ),
         )
+
+    def _make_decode_request(
+        self,
+        request_id: int,
+        *,
+        token_length: int,
+        sampling: SamplingConfig | None = None,
+    ) -> RequestState:
+        request = RequestState.from_prompt(
+            request_id=request_id,
+            prompt_token_ids=[request_id],
+            sampling=sampling or self.config.sampling,
+            max_new_tokens=2,
+            eos_token_id=FakeTokenizer.eos_token_id,
+            created_at_s=float(request_id),
+        )
+        request.all_token_ids = [request_id] * token_length
+        return request
 
     def test_round_robin_token_order(self):
         runtime = FakeRuntime()
@@ -221,6 +241,77 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual([result.stop_reason for result in results], ["max_new_tokens", "max_new_tokens"])
         self.assertEqual([result.token_ids for result in results], [[11, 21], [12, 22]])
         self.assertEqual(engine.capacity.reserved_tokens, 0)
+
+    def test_select_decode_batch_prefers_fuller_compatible_cohort(self):
+        runtime = FakeRuntime()
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_decode_batch_size=2,
+            decode_selection_window=4,
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+        decode_queue = deque(
+            [
+                self._make_decode_request(1, token_length=5),
+                self._make_decode_request(2, token_length=7),
+                self._make_decode_request(3, token_length=7),
+                self._make_decode_request(4, token_length=9),
+            ]
+        )
+
+        batch = engine._select_decode_batch(decode_queue)
+
+        self.assertEqual([request.request_id for request in batch], [2, 3])
+        self.assertEqual([request.request_id for request in decode_queue], [1, 4])
+
+    def test_select_decode_batch_tie_breaks_to_older_group(self):
+        runtime = FakeRuntime()
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_decode_batch_size=2,
+            decode_selection_window=4,
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+        decode_queue = deque(
+            [
+                self._make_decode_request(1, token_length=5),
+                self._make_decode_request(2, token_length=5),
+                self._make_decode_request(3, token_length=7),
+                self._make_decode_request(4, token_length=7),
+            ]
+        )
+
+        batch = engine._select_decode_batch(decode_queue)
+
+        self.assertEqual([request.request_id for request in batch], [1, 2])
+        self.assertEqual([request.request_id for request in decode_queue], [3, 4])
+
+    def test_select_decode_batch_respects_window_limit(self):
+        runtime = FakeRuntime()
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_decode_batch_size=2,
+            decode_selection_window=4,
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+        decode_queue = deque(
+            [
+                self._make_decode_request(1, token_length=5),
+                self._make_decode_request(2, token_length=7),
+                self._make_decode_request(3, token_length=7),
+                self._make_decode_request(4, token_length=9),
+                self._make_decode_request(5, token_length=9),
+                self._make_decode_request(6, token_length=9),
+            ]
+        )
+
+        batch = engine._select_decode_batch(decode_queue)
+
+        self.assertEqual([request.request_id for request in batch], [2, 3])
+        self.assertEqual([request.request_id for request in decode_queue], [1, 4, 5, 6])
 
 
 if __name__ == "__main__":
