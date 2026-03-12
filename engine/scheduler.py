@@ -231,18 +231,19 @@ class LLMEngine:
         return eligible, blocked
 
     def _sample_next_tokens(self, logits: torch.Tensor, requests: List[RequestState]) -> torch.Tensor:
-        next_logits = logits[:, -1, :]
-        next_logits = apply_repetition_penalty_(
-            next_logits,
-            [request.seen_token_ids for request in requests],
-            penalty=requests[0].sampling.repetition_penalty,
-        )
-        return sample_next_token(
-            next_logits,
-            temperature=requests[0].sampling.temperature,
-            top_p=requests[0].sampling.top_p,
-            top_k=requests[0].sampling.top_k,
-        )
+        with torch.inference_mode():
+            next_logits = logits[:, -1, :].clone()
+            next_logits = apply_repetition_penalty_(
+                next_logits,
+                [request.seen_token_ids for request in requests],
+                penalty=requests[0].sampling.repetition_penalty,
+            )
+            return sample_next_token(
+                next_logits,
+                temperature=requests[0].sampling.temperature,
+                top_p=requests[0].sampling.top_p,
+                top_k=requests[0].sampling.top_k,
+            )
 
     def _forward_paged_batch(self, requests: List[RequestState]) -> torch.Tensor:
         eligible, _ = self._prepare_paged_batch(requests, defer_on_capacity=False)
