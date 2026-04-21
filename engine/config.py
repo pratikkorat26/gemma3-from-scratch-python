@@ -23,3 +23,4 @@ class EngineConfig:
     max_kv_cache_tokens: int = 32_768
     kv_block_size: int = 16
     num_kv_blocks: Optional[int] = None
+    prefill_chunk_size: Optional[int] = None

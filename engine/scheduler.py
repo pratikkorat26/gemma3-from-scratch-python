@@ -142,16 +142,16 @@ class LLMEngine:
         request.text_chunks = []
         request.past_kv = None
         request.block_table = []
+        request.prompt_cursor = 0
         request.num_computed_tokens = 0
         request.live_kv_tokens = 0
         request.stop_reason = None
         request.error_message = None
         request.prefill_time_s = 0.0
+        request.prefill_steps = 0
         request.decode_time_s = 0.0
         request.decode_steps = 0
-
-        prompt_ids = torch.tensor(request.prompt_token_ids, device=self.runtime.device).unsqueeze(0)
-        request.current_input = prompt_ids
+        request.current_input = self._next_prefill_chunk(request)
 
     def _make_result(self, request: RequestState) -> GenerationResult:
         first_scheduled = request.first_scheduled_at_s if request.first_scheduled_at_s is not None else request.created_at_s
@@ -180,9 +180,27 @@ class LLMEngine:
             decode_s=request.decode_time_s,
             total_latency_s=total_latency_s,
             model_tokens_per_s=model_tokens_per_s,
-            prefill_steps=1 if request.prefill_time_s > 0 else 0,
+            prefill_steps=request.prefill_steps,
             decode_steps=request.decode_steps,
         )
+
+    def _prefill_chunk_size(self, request: RequestState) -> int:
+        chunk_size = self.config.prefill_chunk_size
+        if chunk_size is None or chunk_size <= 0:
+            return max(1, len(request.prompt_token_ids) - request.prompt_cursor)
+        return max(1, int(chunk_size))
+
+    def _next_prefill_chunk(self, request: RequestState) -> Optional[torch.Tensor]:
+        if request.prompt_cursor >= len(request.prompt_token_ids):
+            return None
+        chunk_size = self._prefill_chunk_size(request)
+        chunk_ids = request.prompt_token_ids[request.prompt_cursor : request.prompt_cursor + chunk_size]
+        if not chunk_ids:
+            return None
+        return torch.tensor(chunk_ids, device=self.runtime.device).unsqueeze(0)
+
+    def _prefill_complete(self, request: RequestState) -> bool:
+        return request.prompt_cursor >= len(request.prompt_token_ids)
 
     def _build_block_tables(self, requests: List[RequestState]) -> torch.Tensor:
         max_blocks = max(len(request.block_table) for request in requests)
@@ -311,6 +329,29 @@ class LLMEngine:
         request.decode_steps += 1
 
         self._record_next_token(request, next_token, emit_text=emit_text)
+
+    def _run_prefill_chunk(self, request: RequestState) -> Optional[torch.Tensor]:
+        if request.current_input is None:
+            request.current_input = self._next_prefill_chunk(request)
+        if request.current_input is None:
+            return None
+
+        started = time.perf_counter()
+        logits = self._forward_paged_batch([request])
+        if request.status in ("finished", "error"):
+            return None
+
+        elapsed = time.perf_counter() - started
+        request.prefill_time_s += elapsed
+        request.prefill_steps += 1
+        request.prompt_cursor += int(request.current_input.shape[1])
+
+        if self._prefill_complete(request):
+            return logits
+
+        request.current_input = self._next_prefill_chunk(request)
+        request.phase = "prefill"
+        return None
 
     def _sampling_key(self, request: RequestState):
         return (
@@ -444,12 +485,17 @@ class LLMEngine:
                             request.first_scheduled_at_s = time.perf_counter()
                             self._init_request(request)
                         request.phase = "prefill"
-                        self._run_one_step(request, phase="prefill")
+                        final_prefill_logits = self._run_prefill_chunk(request)
+                        if request.status not in ("finished", "error") and final_prefill_logits is not None:
+                            next_token = self._sample_next_tokens(final_prefill_logits, [request])
+                            self._record_next_token(request, next_token, emit_text=False)
                 except Exception as exc:
                     self._finish_request(request, reason="error", error_message=str(exc))
 
                 if request.status in ("finished", "error"):
                     results[request.request_id] = self._make_result(request)
+                elif not self._prefill_complete(request):
+                    prefill_queue.append(request)
                 else:
                     decode_queue.append(request)
                 continue
@@ -510,9 +556,15 @@ class LLMEngine:
         self._init_request(request)
 
         try:
-            self._run_one_step(request, phase="prefill", emit_text=True)
-            if request.text_chunks:
-                yield StreamEvent(kind="text", text=request.text_chunks[-1])
+            final_prefill_logits = None
+            while request.status not in ("finished", "error") and not self._prefill_complete(request):
+                final_prefill_logits = self._run_prefill_chunk(request)
+
+            if request.status not in ("finished", "error") and final_prefill_logits is not None:
+                next_token = self._sample_next_tokens(final_prefill_logits, [request])
+                self._record_next_token(request, next_token, emit_text=True)
+                if request.text_chunks:
+                    yield StreamEvent(kind="text", text=request.text_chunks[-1])
 
             while request.status not in ("finished", "error"):
                 previous_chunks = len(request.text_chunks)

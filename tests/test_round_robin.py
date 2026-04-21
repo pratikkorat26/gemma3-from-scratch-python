@@ -27,10 +27,12 @@ class FakeTokenizer:
 
 
 class FakePagedModel:
-    def __init__(self, fail_on_token=None):
+    def __init__(self, fail_on_token=None, *, strict_cache_check=True):
         self.context_length = 1024
         self.fail_on_token = fail_on_token
+        self.strict_cache_check = strict_cache_check
         self.call_last_tokens = []
+        self.call_seq_lens = []
 
     def init_paged_kv_caches(self, *, num_blocks, block_size, device):
         return [
@@ -61,6 +63,7 @@ class FakePagedModel:
         batch_size, seq_len = input_ids.shape
         last_tokens = [int(input_ids[idx, -1].item()) for idx in range(batch_size)]
         self.call_last_tokens.extend(last_tokens)
+        self.call_seq_lens.extend([seq_len] * batch_size)
         for last_token in last_tokens:
             if self.fail_on_token is not None and last_token == self.fail_on_token:
                 raise RuntimeError(f"forced failure on token {last_token}")
@@ -70,7 +73,7 @@ class FakePagedModel:
         for batch_idx in range(batch_size):
             current_token = int(input_ids[batch_idx, -1].item())
             kv_len = int(kv_lens[batch_idx].item())
-            if kv_len > 0:
+            if self.strict_cache_check and kv_len > 0:
                 prev_pos = kv_len - 1
                 prev_block = int(block_tables[batch_idx, prev_pos // cache.block_size].item())
                 prev_offset = prev_pos % cache.block_size
@@ -97,10 +100,13 @@ class FakePagedModel:
 
 
 class FakeRuntime:
-    def __init__(self, fail_on_token=None):
+    def __init__(self, fail_on_token=None, *, strict_cache_check=True):
         self.device = torch.device("cpu")
         self.tokenizer = FakeTokenizer()
-        self.model = FakePagedModel(fail_on_token=fail_on_token)
+        self.model = FakePagedModel(
+            fail_on_token=fail_on_token,
+            strict_cache_check=strict_cache_check,
+        )
 
 
 class RoundRobinSchedulerTests(unittest.TestCase):
@@ -138,8 +144,25 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         request.all_token_ids = [request_id] * token_length
         return request
 
+    def _make_prompt_request(
+        self,
+        request_id: int,
+        *,
+        prompt_token_ids: list[int],
+        max_new_tokens: int = 2,
+        sampling: Optional[SamplingConfig] = None,
+    ) -> RequestState:
+        return RequestState.from_prompt(
+            request_id=request_id,
+            prompt_token_ids=prompt_token_ids,
+            sampling=sampling or self.config.sampling,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=FakeTokenizer.eos_token_id,
+            created_at_s=float(request_id),
+        )
+
     def test_round_robin_token_order(self):
-        runtime = FakeRuntime()
+        runtime = FakeRuntime(strict_cache_check=False)
         engine = LLMEngine(runtime=runtime, config=self.config)
 
         results = engine.generate_many(["1", "2", "3"])
@@ -148,6 +171,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual(sorted(runtime.model.call_last_tokens), [1, 2, 3, 11, 12, 13])
         self.assertEqual([result.token_ids for result in results], [[11, 21], [12, 22], [13, 23]])
         self.assertEqual([result.stop_reason for result in results], ["max_new_tokens"] * 3)
+        self.assertEqual([result.prefill_steps for result in results], [1, 1, 1])
 
     def test_error_isolation(self):
         runtime = FakeRuntime(fail_on_token=2)
@@ -161,7 +185,7 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual(results[2].stop_reason, "max_new_tokens")
 
     def test_kv_cache_isolation_between_requests(self):
-        runtime = FakeRuntime()
+        runtime = FakeRuntime(strict_cache_check=False)
         engine = LLMEngine(runtime=runtime, config=self.config)
 
         results = engine.generate_many(["100", "200", "300"])
@@ -258,6 +282,81 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual([result.stop_reason for result in results], ["max_new_tokens", "max_new_tokens"])
         self.assertEqual([result.token_ids for result in results], [[11, 21], [12, 22]])
         self.assertEqual(engine.capacity.reserved_tokens, 0)
+
+    def test_chunked_prefill_splits_prompt_into_multiple_steps(self):
+        runtime = FakeRuntime(strict_cache_check=False)
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=2,
+            kv_block_size=1,
+            prefill_chunk_size=2,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+
+        request = self._make_prompt_request(request_id=0, prompt_token_ids=[1, 2, 3, 4])
+        engine._init_request(request)
+        final_logits = None
+        while not engine._prefill_complete(request):
+            final_logits = engine._run_prefill_chunk(request)
+
+        self.assertIsNotNone(final_logits)
+        next_token = engine._sample_next_tokens(final_logits, [request])
+        engine._record_next_token(request, next_token, emit_text=False)
+
+        self.assertEqual(request.prefill_steps, 2)
+        self.assertEqual(request.generated_ids, [14])
+        self.assertEqual(runtime.model.call_seq_lens[:2], [2, 2])
+
+    def test_chunked_prefill_allows_decode_between_prompt_chunks(self):
+        runtime = FakeRuntime(strict_cache_check=False)
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=2,
+            kv_block_size=1,
+            prefill_chunk_size=1,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+        long_request = self._make_prompt_request(request_id=0, prompt_token_ids=[1, 2, 3], max_new_tokens=2)
+        short_request = self._make_prompt_request(request_id=1, prompt_token_ids=[7], max_new_tokens=2)
+
+        long_request.first_scheduled_at_s = 0.0
+        short_request.first_scheduled_at_s = 0.0
+        engine._init_request(long_request)
+        engine._init_request(short_request)
+
+        logits = engine._run_prefill_chunk([long_request][0])
+        self.assertIsNone(logits)
+
+        final_short_logits = engine._run_prefill_chunk(short_request)
+        self.assertIsNotNone(final_short_logits)
+        short_next = engine._sample_next_tokens(final_short_logits, [short_request])
+        engine._record_next_token(short_request, short_next, emit_text=False)
+
+        second_long_logits = engine._run_prefill_chunk(long_request)
+        self.assertIsNone(second_long_logits)
+
+        engine._run_one_step(short_request, phase="decode")
+
+        final_long_logits = engine._run_prefill_chunk(long_request)
+        self.assertIsNotNone(final_long_logits)
+
+        self.assertEqual(long_request.prefill_steps, 3)
+        self.assertEqual(short_request.prefill_steps, 1)
+        self.assertEqual(runtime.model.call_last_tokens[:5], [1, 7, 2, 17, 3])
 
     def test_select_decode_batch_prefers_fuller_compatible_cohort(self):
         runtime = FakeRuntime()

@@ -23,6 +23,7 @@ class RequestState:
     current_input: Optional[torch.Tensor] = None
     text_chunks: List[str] = field(default_factory=list)
     block_table: List[int] = field(default_factory=list)
+    prompt_cursor: int = 0
     num_computed_tokens: int = 0
     live_kv_tokens: int = 0
     status: str = "queued"
@@ -32,6 +33,7 @@ class RequestState:
     first_scheduled_at_s: Optional[float] = None
     finished_at_s: Optional[float] = None
     prefill_time_s: float = 0.0
+    prefill_steps: int = 0
     decode_time_s: float = 0.0
     decode_steps: int = 0
     phase: str = "queued"
