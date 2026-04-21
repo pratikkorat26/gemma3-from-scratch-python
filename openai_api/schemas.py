@@ -8,7 +8,7 @@ SUPPORTED_MODEL = "gemma-3-270m-it"
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: str = Field(min_length=1)
+    content: str = Field(min_length=1, max_length=32_768)
 
 
 class ChatCompletionRequest(BaseModel):
