@@ -142,7 +142,6 @@ class LLMEngine:
         request.text_chunks = []
         request.block_table = []
         request.prompt_cursor = 0
-        request.num_computed_tokens = 0
         request.live_kv_tokens = 0
         request.stop_reason = None
         request.error_message = None
@@ -291,7 +290,6 @@ class LLMEngine:
 
         for request in eligible:
             request.live_kv_tokens += int(request.current_input.shape[1])
-            request.num_computed_tokens = request.live_kv_tokens
         return logits
 
     def _record_next_token(self, request: RequestState, next_token: torch.Tensor, *, emit_text: bool) -> None:
@@ -434,7 +432,6 @@ class LLMEngine:
 
         for batch_idx, request in enumerate(eligible):
             request.live_kv_tokens += int(request.current_input.shape[1])
-            request.num_computed_tokens = request.live_kv_tokens
             request.decode_time_s += per_request_elapsed
             request.decode_steps += 1
             self._record_next_token(request, next_tokens[batch_idx : batch_idx + 1], emit_text=False)
@@ -609,18 +606,3 @@ class LLMEngine:
             if event.kind == "text" and event.text:
                 yield event.text
 
-    def generate(
-        self,
-        prompt: str,
-        *,
-        sampling: Optional[SamplingConfig] = None,
-        max_new_tokens: Optional[int] = None,
-    ) -> str:
-        result = self.generate_many(
-            [prompt],
-            sampling=sampling,
-            max_new_tokens=max_new_tokens,
-        )[0]
-        if result.error_message is not None:
-            raise RuntimeError(result.error_message)
-        return result.text

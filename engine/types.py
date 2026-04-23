@@ -20,7 +20,6 @@ class RequestState:
     text_chunks: List[str] = field(default_factory=list)
     block_table: List[int] = field(default_factory=list)
     prompt_cursor: int = 0
-    num_computed_tokens: int = 0
     live_kv_tokens: int = 0
     status: str = "queued"
     stop_reason: Optional[str] = None
