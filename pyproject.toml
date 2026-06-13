@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemma3-from-scratch-python"
+version = "0.1.0"
+description = "Readable Gemma 3 270M inference implementation with a local OpenAI-like API."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi",
+    "huggingface_hub",
+    "pydantic",
+    "safetensors",
+    "starlette",
+    "tokenizers",
+    "torch",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+benchmark = ["pandas"]
+dev = ["pytest"]
+
+[project.scripts]
+gemma3-generate = "main:main"
+
+[tool.setuptools]
+py-modules = ["main", "query_fastapi"]
+
+[tool.setuptools.packages.find]
+include = [
+    "adapters*",
+    "app*",
+    "config*",
+    "engine*",
+    "gemma3*",
+    "inference*",
+    "openai_api*",
+    "runtime*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

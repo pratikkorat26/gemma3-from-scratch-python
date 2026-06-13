@@ -25,6 +25,12 @@ Provide a small, understandable codebase for:
 python -m pip install torch tokenizers safetensors huggingface_hub fastapi uvicorn pydantic starlette
 ```
 
+Or install the local package metadata:
+
+```bash
+python -m pip install -e ".[dev,benchmark]"
+```
+
 Model access note:
 - You need approved access to Gemma checkpoints (for example `google/gemma-3-270m` / `google/gemma-3-270m-it`) before first download.
 - If local model files already exist in `gemma-3-270m/` or `gemma-3-270m-it/`, they are reused.
@@ -49,6 +55,13 @@ OpenAI-like API server:
 python -m openai_api.run
 ```
 
+The API binds to `127.0.0.1:8000` by default. Use CLI flags or `GEMMA_API_*` environment variables to tune it:
+
+```bash
+python -m openai_api.run --host 0.0.0.0 --port 8080 --device cpu --default-max-tokens 64
+GEMMA_API_MAX_KV_CACHE_TOKENS=65536 python -m openai_api.run
+```
+
 Query the API:
 
 ```bash
@@ -57,11 +70,28 @@ python query_fastapi.py --stream --prompt "Give me one short line about LLM infe
 
 ## Project Structure
 
-- `gemma3/`: model components, paged KV storage, RoPE, feedforward, and weights mapping
-- `engine/`: runtime, sampling, block-based KV allocator, and request scheduler
-- `openai_api/`: FastAPI app, schemas, prompting, and chat service
+- `gemma3/`: model components, paged KV storage, RoPE, feedforward, tokenizer template, and weights mapping
+- `inference/`: deep inference core: engine contract, generation types, scheduler, KV allocation, sampling, and batching policy
+- `runtime/`: model/tokenizer loading, device resolution, runtime provider, and warmup boundary
+- `app/`: serving/application layer: request validation, readiness, metrics, logging, and chat completion orchestration
+- `adapters/openai/`: FastAPI/OpenAI compatibility adapter: schemas, routes, mapping, SSE, and HTTP errors
+- `adapters/prometheus/`: metrics formatting adapter
+- `config/`: typed runtime/server settings and environment/CLI parsing
+- `engine/` and `openai_api/`: compatibility facades for older imports
 - `main.py`: direct local generation flow
 - `tests/`: scheduler and API response-shape tests
+
+## Architecture Boundaries
+
+The core design rule is: the inference core is deep, external interfaces are thin.
+
+- `gemma3/` contains tensor/model code only and does not import serving, runtime, FastAPI, or OpenAI API modules.
+- `inference/` owns generation lifecycle, scheduling, KV cache management, sampling, stop reasons, and engine contracts. It does not import FastAPI, OpenAI schemas, app services, or runtime loaders.
+- `runtime/` builds ready model/tokenizer/backend objects from local files or Hugging Face artifacts. It does not import HTTP or app code.
+- `app/` coordinates service behavior around the engine without depending on FastAPI or OpenAI schemas.
+- `adapters/openai/` is the replaceable HTTP compatibility layer and must not import `torch` or construct models directly.
+
+Architecture regression tests in `tests/architecture/` enforce these dependency rules.
 
 ## Engine Configuration
 
@@ -77,9 +107,14 @@ This keeps the engine readable while matching the basic vLLM-style idea: admit r
 
 - `GET /healthz`: lightweight liveness probe
 - `GET /readyz`: readiness probe; returns `200` only after `ChatCompletionService` has loaded successfully
+- `GET /v1/models`: OpenAI-style local model listing
+- `GET /stats`: JSON request/token/latency counters
+- `GET /metrics`: dependency-free Prometheus-style text metrics
 - `POST /v1/chat/completions`: returns `503` if service startup failed or is not yet complete
 
-The API now initializes `ChatCompletionService` during app startup, so model load and download failures surface at boot instead of on the first request.
+The API initializes `ChatCompletionService` during app startup, serializes access to the shared engine per process, enforces request/message size limits, and returns generic client-facing errors while logging details server-side.
+
+Supported chat request controls include `max_tokens`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop`, `stream`, and `stream_options.include_usage`.
 
 ## Request Flow
 

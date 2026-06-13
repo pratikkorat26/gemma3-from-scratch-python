@@ -164,19 +164,48 @@ class GroupedQueryAttention(nn.Module):
         kv_lens: torch.Tensor,
         paged_kv_cache: PagedKVCache,
     ) -> None:
-        _, _, q_len, _ = k_new.shape
+        batch_size, num_kv_groups, q_len, head_dim = k_new.shape
         block_size = paged_kv_cache.block_size
-        for batch_idx in range(k_new.shape[0]):
-            start_pos = int(kv_lens[batch_idx].item())
-            for token_offset in range(q_len):
-                position = start_pos + token_offset
-                block_slot = position // block_size
-                block_offset = position % block_size
-                block_id = int(block_tables[batch_idx, block_slot].item())
-                if block_id < 0:
-                    raise ValueError("paged KV block table is missing an assigned block")
-                paged_kv_cache.k_blocks[block_id, :, block_offset, :] = k_new[batch_idx, :, token_offset, :]
-                paged_kv_cache.v_blocks[block_id, :, block_offset, :] = v_new[batch_idx, :, token_offset, :]
+        device = k_new.device
+
+        start_pos = kv_lens.unsqueeze(1)
+        token_offsets = torch.arange(q_len, device=device, dtype=torch.long).unsqueeze(0)
+        positions = start_pos + token_offsets
+
+        block_slots = positions // block_size
+        block_offsets = positions % block_size
+
+        block_ids = block_tables.gather(1, block_slots)
+
+        if (block_ids < 0).any():
+            raise ValueError("paged KV block table is missing an assigned block")
+
+        batch_idx_all = torch.arange(batch_size, device=device).unsqueeze(1).expand(batch_size, q_len)
+        token_idx_all = torch.arange(q_len, device=device).unsqueeze(0).expand(batch_size, q_len)
+
+        valid_block_ids = block_ids.view(-1)
+        valid_offsets = block_offsets.view(-1)
+        valid_batch = batch_idx_all.view(-1)
+        valid_token = token_idx_all.view(-1)
+
+        k_values = k_new[valid_batch, :, valid_token, :]
+        v_values = v_new[valid_batch, :, valid_token, :]
+
+        k_values = k_values.permute(1, 0, 2).reshape(num_kv_groups, batch_size * q_len, head_dim)
+        v_values = v_values.permute(1, 0, 2).reshape(num_kv_groups, batch_size * q_len, head_dim)
+
+        num_blocks = paged_kv_cache.k_blocks.shape[0]
+        block_idx_expanded = valid_block_ids.unsqueeze(0).expand(num_kv_groups, -1)
+        group_idx = torch.arange(num_kv_groups, device=device).unsqueeze(1).expand(num_kv_groups, batch_size * q_len)
+        offset_expanded = valid_offsets.unsqueeze(0).expand(num_kv_groups, -1)
+
+        k_flat = paged_kv_cache.k_blocks.view(num_kv_groups, num_blocks * block_size, head_dim)
+        v_flat = paged_kv_cache.v_blocks.view(num_kv_groups, num_blocks * block_size, head_dim)
+
+        flat_indices = block_idx_expanded * block_size + offset_expanded
+
+        k_flat.scatter_(1, flat_indices.unsqueeze(-1).expand(-1, -1, head_dim), k_values)
+        v_flat.scatter_(1, flat_indices.unsqueeze(-1).expand(-1, -1, head_dim), v_values)
 
     def _gather_sequence_kv(
         self,

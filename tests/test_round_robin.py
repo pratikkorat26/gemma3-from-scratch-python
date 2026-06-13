@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -20,6 +21,8 @@ class FakeTokenizer:
     eos_token_id = 999
 
     def encode(self, text):
+        if " " in text:
+            return [int(part) for part in text.split()]
         return [int(text)]
 
     def decode(self, ids, skip_special_tokens=False):
@@ -107,6 +110,43 @@ class FakeRuntime:
             fail_on_token=fail_on_token,
             strict_cache_check=strict_cache_check,
         )
+
+
+class FakeSamplingModel(FakePagedModel):
+    def __call__(
+        self,
+        input_ids,
+        *,
+        block_tables=None,
+        kv_lens=None,
+        paged_kv_caches=None,
+        past_kv=None,
+        use_cache=True,
+    ):
+        if block_tables is None or kv_lens is None or paged_kv_caches is None:
+            raise RuntimeError("paged KV inputs are required")
+
+        batch_size, seq_len = input_ids.shape
+        logits = torch.full((batch_size, seq_len, 4096), -1e9)
+        logits[:, -1, 100] = 0.0
+        logits[:, -1, 200] = 0.0
+        return logits
+
+
+class FakeSamplingRuntime(FakeRuntime):
+    def __init__(self):
+        self.device = torch.device("cpu")
+        self.tokenizer = FakeTokenizer()
+        self.model = FakeSamplingModel(strict_cache_check=False)
+
+
+@dataclass(frozen=True)
+class FakeSeededSampling:
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = 0
+    repetition_penalty: float = 1.0
+    seed: Optional[int] = None
 
 
 class RoundRobinSchedulerTests(unittest.TestCase):
@@ -229,6 +269,70 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual(result.stop_reason, "capacity_exceeded")
         self.assertIn("KV cache capacity exceeded", result.error_message or "")
         self.assertEqual(result.token_ids, [11])
+
+    def test_stream_capacity_error_preserves_message(self):
+        runtime = FakeRuntime()
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=2,
+            max_kv_cache_tokens=1,
+            kv_block_size=1,
+            num_kv_blocks=1,
+            num_prefill_workers=1,
+            num_decode_workers=1,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+
+        events = list(engine.generate_stream_events("1 2", max_new_tokens=2))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "done")
+        self.assertEqual(events[0].stop_reason, "capacity_exceeded")
+        self.assertIn("KV cache capacity exceeded", events[0].error_message or "")
+
+    def test_stream_text_events_include_token_metadata(self):
+        runtime = FakeRuntime(strict_cache_check=False)
+        engine = LLMEngine(runtime=runtime, config=self.config)
+
+        events = list(engine.generate_stream_events("1", max_new_tokens=2))
+        text_events = [event for event in events if event.kind == "text"]
+
+        self.assertEqual([event.text for event in text_events], ["<11>", "<21>"])
+        self.assertEqual([event.token_id for event in text_events], [11, 21])
+        self.assertEqual([event.generated_token_count for event in text_events], [1, 2])
+
+    def test_seeded_sampling_does_not_use_global_rng(self):
+        sampling = FakeSeededSampling(seed=1234)
+
+        torch.manual_seed(1)
+        first = LLMEngine(runtime=FakeSamplingRuntime(), config=self.config).generate_many(
+            ["1"],
+            sampling=sampling,  # type: ignore[arg-type]
+            max_new_tokens=8,
+        )[0]
+
+        torch.manual_seed(999)
+        second = LLMEngine(runtime=FakeSamplingRuntime(), config=self.config).generate_many(
+            ["1"],
+            sampling=sampling,  # type: ignore[arg-type]
+            max_new_tokens=8,
+        )[0]
+
+        self.assertEqual(first.token_ids, second.token_ids)
+
+        batched = LLMEngine(runtime=FakeSamplingRuntime(), config=self.config).generate_many(
+            ["1", "2"],
+            sampling=sampling,  # type: ignore[arg-type]
+            max_new_tokens=8,
+        )
+        self.assertEqual(batched[0].token_ids, batched[1].token_ids)
 
     def test_capacity_released_after_finished_request(self):
         runtime = FakeRuntime()

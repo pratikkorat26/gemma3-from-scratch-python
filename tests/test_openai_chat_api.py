@@ -10,7 +10,11 @@ except ModuleNotFoundError:
 
 
 class FakeChatService:
+    def __init__(self):
+        self.requests_total = 0
+
     def create_chat_completion(self, request):
+        self.requests_total += 1
         return {
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -27,10 +31,33 @@ class FakeChatService:
         }
 
     def stream_chat_completion(self, request):
+        self.requests_total += 1
         yield 'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
         yield 'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}\n\n'
+        if getattr(getattr(request, "stream_options", None), "include_usage", False):
+            yield 'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}\n\n'
         yield 'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
         yield "data: [DONE]\n\n"
+
+    def list_models(self):
+        return {
+            "object": "list",
+            "data": [{"id": SUPPORTED_MODEL, "object": "model", "created": 0, "owned_by": "local"}],
+        }
+
+    def stats(self):
+        return {
+            "model": SUPPORTED_MODEL,
+            "requests_total": self.requests_total,
+            "requests_failed": 0,
+            "tokens_prompt_total": 10 * self.requests_total,
+            "tokens_completion_total": self.requests_total,
+            "latency_s": {"last": 0.0, "avg": 0.0},
+            "generation": {},
+        }
+
+    def metrics_text(self):
+        return f'gemma_requests_total{{model="{SUPPORTED_MODEL}"}} {self.requests_total}\n'
 
 
 @unittest.skipUnless(FASTAPI_AVAILABLE, "fastapi is not installed")
@@ -87,6 +114,83 @@ class OpenAIChatAPITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ready"})
 
+    def test_models_response_shape(self):
+        response = self.client.get("/v1/models")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["object"], "list")
+        self.assertEqual(payload["data"][0]["id"], SUPPORTED_MODEL)
+
+    def test_stats_response_shape(self):
+        self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": SUPPORTED_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        response = self.client.get("/stats")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["model"], SUPPORTED_MODEL)
+        self.assertEqual(payload["requests_total"], 1)
+
+    def test_metrics_response_shape(self):
+        response = self.client.get("/metrics")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/plain", response.headers["content-type"])
+        self.assertIn("gemma_requests_total", response.text)
+
+    def test_accepts_extended_sampling_fields(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": SUPPORTED_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "top_k": 20,
+                "repetition_penalty": 1.2,
+                "seed": 123,
+                "stop": ["\n"],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_rejects_too_many_messages(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": SUPPORTED_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}] * 65,
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_rejects_empty_stop_sequence(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": SUPPORTED_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stop": [""],
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_stream_response_can_include_usage(self):
+        with self.client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": SUPPORTED_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        ) as response:
+            self.assertEqual(response.status_code, 200)
+            body = "".join(part for part in response.iter_text())
+            self.assertIn('"usage"', body)
+
 
 @unittest.skipUnless(FASTAPI_AVAILABLE, "fastapi is not installed")
 class OpenAIChatAPIStartupFailureTests(unittest.TestCase):
@@ -104,7 +208,7 @@ class OpenAIChatAPIStartupFailureTests(unittest.TestCase):
     def test_readyz_reports_startup_failure(self):
         response = self.client.get("/readyz")
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["detail"], "service unavailable: model init failed")
+        self.assertEqual(response.json()["detail"], "service unavailable: startup failed")
 
     def test_chat_completion_fails_fast_when_service_unavailable(self):
         response = self.client.post(
@@ -115,7 +219,7 @@ class OpenAIChatAPIStartupFailureTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["detail"], "service unavailable: model init failed")
+        self.assertEqual(response.json()["detail"], "service unavailable: startup failed")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+{
+  "max_error_rate": 0.0,
+  "max_p95_total_s": 60.0,
+  "min_throughput_tps": 0.5
+}
