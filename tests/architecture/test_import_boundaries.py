@@ -31,22 +31,22 @@ def _has_forbidden(imports: set[str], forbidden: tuple[str, ...]) -> list[str]:
 class ImportBoundaryTests(unittest.TestCase):
     def test_gemma3_has_no_serving_dependencies(self):
         imports = _imports_for("gemma3")
-        forbidden = ("app", "adapters", "openai_api", "runtime", "fastapi")
+        forbidden = ("app", "adapters", "runtime", "fastapi")
         self.assertEqual(_has_forbidden(imports, forbidden), [])
 
     def test_inference_has_no_http_or_runtime_dependencies(self):
         imports = _imports_for("inference")
-        forbidden = ("fastapi", "starlette", "openai_api", "adapters.openai", "app", "runtime")
+        forbidden = ("fastapi", "starlette", "adapters.openai", "app", "runtime")
         self.assertEqual(_has_forbidden(imports, forbidden), [])
 
     def test_runtime_has_no_http_dependencies(self):
         imports = _imports_for("runtime")
-        forbidden = ("fastapi", "starlette", "openai_api", "adapters.openai", "app")
+        forbidden = ("fastapi", "starlette", "adapters.openai", "app")
         self.assertEqual(_has_forbidden(imports, forbidden), [])
 
     def test_app_has_no_http_or_openai_dependencies(self):
         imports = _imports_for("app")
-        forbidden = ("fastapi", "starlette", "openai_api", "adapters.openai")
+        forbidden = ("fastapi", "starlette", "adapters.openai")
         self.assertEqual(_has_forbidden(imports, forbidden), [])
 
     def test_openai_adapter_does_not_import_torch(self):

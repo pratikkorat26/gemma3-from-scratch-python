@@ -25,6 +25,7 @@ dev = ["pytest"]
 
 [project.scripts]
 gemma3-generate = "main:main"
+gemma3-serve = "adapters.openai.run:main"
 
 [tool.setuptools]
 py-modules = ["main", "query_fastapi"]
@@ -34,10 +35,8 @@ include = [
     "adapters*",
     "app*",
     "config*",
-    "engine*",
     "gemma3*",
     "inference*",
-    "openai_api*",
     "runtime*",
 ]
 

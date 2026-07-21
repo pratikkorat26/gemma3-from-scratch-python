@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -8,7 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from engine import EngineConfig, GemmaRuntime, LLMEngine, SamplingConfig, get_device
+from inference import EngineConfig, GenerateRequest, LLMEngine, SamplingConfig
+from runtime import GemmaRuntime, get_device
 
 
 def build_engine(runtime: GemmaRuntime, *, prefill_chunk_size: Optional[int]) -> LLMEngine:
@@ -29,10 +31,10 @@ def build_engine(runtime: GemmaRuntime, *, prefill_chunk_size: Optional[int]) ->
     )
 
 
-def run_case(runtime: GemmaRuntime, *, prompt: str, prefill_chunk_size: Optional[int]) -> dict:
+async def run_case(runtime: GemmaRuntime, *, prompt: str, prefill_chunk_size: Optional[int]) -> dict:
     engine = build_engine(runtime, prefill_chunk_size=prefill_chunk_size)
     started = time.perf_counter()
-    result = engine.generate_many([prompt])[0]
+    result = await engine.generate(GenerateRequest("case", prompt))
     elapsed_s = time.perf_counter() - started
     tok_per_s = 0.0 if elapsed_s <= 0 else len(result.token_ids) / elapsed_s
 
@@ -44,6 +46,7 @@ def run_case(runtime: GemmaRuntime, *, prompt: str, prefill_chunk_size: Optional
     print(f"generated_tokens={len(result.token_ids)}")
     print(f"end_to_end_tok_per_s={tok_per_s:.2f}")
     print(f"text_preview={result.text[:200]!r}")
+    await engine.shutdown()
     return {
         "prefill_chunk_size": prefill_chunk_size,
         "elapsed_s": elapsed_s,
@@ -54,7 +57,7 @@ def run_case(runtime: GemmaRuntime, *, prompt: str, prefill_chunk_size: Optional
     }
 
 
-def benchmark_case(
+async def benchmark_case(
     runtime: GemmaRuntime,
     *,
     prompt: str,
@@ -63,17 +66,19 @@ def benchmark_case(
     benchmark_runs: int,
 ) -> dict:
     for _ in range(max(0, warmup_runs)):
-        build_engine(runtime, prefill_chunk_size=prefill_chunk_size).generate_many([prompt])
+        engine = build_engine(runtime, prefill_chunk_size=prefill_chunk_size)
+        await engine.generate(GenerateRequest("warmup", prompt)); await engine.shutdown()
 
     elapsed_values = []
     last_result = None
     for _ in range(max(1, benchmark_runs)):
         engine = build_engine(runtime, prefill_chunk_size=prefill_chunk_size)
         started = time.perf_counter()
-        result = engine.generate_many([prompt])[0]
+        result = await engine.generate(GenerateRequest("benchmark", prompt))
         elapsed_s = time.perf_counter() - started
         elapsed_values.append(elapsed_s)
         last_result = result
+        await engine.shutdown()
 
     avg_elapsed_s = sum(elapsed_values) / len(elapsed_values)
     avg_tok_per_s = 0.0 if avg_elapsed_s <= 0 else len(last_result.token_ids) / avg_elapsed_s
@@ -87,7 +92,7 @@ def benchmark_case(
     }
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description="Show chunked-prefill behavior on one prompt")
     parser.add_argument("--chunk-size", type=int, default=16, help="Prefill chunk size for the chunked run")
     parser.add_argument("--repeat", type=int, default=40, help="How many times to repeat the seed text")
@@ -108,18 +113,18 @@ def main() -> None:
     )
 
     print(f"prompt_chars={len(prompt)}")
-    run_case(runtime, prompt=prompt, prefill_chunk_size=None)
-    run_case(runtime, prompt=prompt, prefill_chunk_size=args.chunk_size)
+    await run_case(runtime, prompt=prompt, prefill_chunk_size=None)
+    await run_case(runtime, prompt=prompt, prefill_chunk_size=args.chunk_size)
 
     print("\nbenchmarking...")
-    base_bench = benchmark_case(
+    base_bench = await benchmark_case(
         runtime,
         prompt=prompt,
         prefill_chunk_size=None,
         warmup_runs=args.warmup_runs,
         benchmark_runs=args.benchmark_runs,
     )
-    chunked_bench = benchmark_case(
+    chunked_bench = await benchmark_case(
         runtime,
         prompt=prompt,
         prefill_chunk_size=args.chunk_size,
@@ -146,4 +151,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

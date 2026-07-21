@@ -26,12 +26,18 @@ class RuntimeSettings:
     top_p: float = 0.9
     top_k: int = 50
     repetition_penalty: float = 1.1
-    max_decode_batch_size: int = 4
+    decode_batch_size: int = 4
     decode_selection_window: int = 8
+    max_queue_size: int = 128
+    max_concurrent_requests: int = 16
+    max_batch_tokens: int = 256
+    request_timeout_s: Optional[float] = None
     max_kv_cache_tokens: int = 32_768
     kv_block_size: int = 16
     num_kv_blocks: Optional[int] = None
     prefill_chunk_size: Optional[int] = None
+    enable_prefix_cache: bool = False
+    max_prefix_cache_entries: int = 64
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,13 @@ def _parse_optional_int(value: str) -> Optional[int]:
     if normalized in {"", "none", "null"}:
         return None
     return int(value)
+
+
+def _parse_optional_float(value: str) -> Optional[float]:
+    normalized = value.strip().lower()
+    if normalized in {"", "none", "null"}:
+        return None
+    return float(value)
 
 
 def _from_env(
@@ -110,12 +123,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-p", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--top-k", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--repetition-penalty", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--max-decode-batch-size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--decode-batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--decode-selection-window", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max-queue-size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max-concurrent-requests", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max-batch-tokens", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--request-timeout-s", type=_parse_optional_float, default=argparse.SUPPRESS)
     parser.add_argument("--max-kv-cache-tokens", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--kv-block-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--num-kv-blocks", type=_parse_optional_int, default=argparse.SUPPRESS)
     parser.add_argument("--prefill-chunk-size", type=_parse_optional_int, default=argparse.SUPPRESS)
+    _add_bool_override(parser, "enable_prefix_cache")
+    parser.add_argument("--max-prefix-cache-entries", type=int, default=argparse.SUPPRESS)
     return parser
 
 
@@ -164,17 +183,41 @@ def load_settings_from_env(env: Mapping[str, str] = os.environ) -> Settings:
                 float,
                 runtime_defaults.repetition_penalty,
             ),
-            max_decode_batch_size=_from_env(
+            decode_batch_size=_from_env(
                 env,
-                "max_decode_batch_size",
+                "decode_batch_size",
                 int,
-                runtime_defaults.max_decode_batch_size,
+                runtime_defaults.decode_batch_size,
             ),
             decode_selection_window=_from_env(
                 env,
                 "decode_selection_window",
                 int,
                 runtime_defaults.decode_selection_window,
+            ),
+            max_queue_size=_from_env(
+                env,
+                "max_queue_size",
+                int,
+                runtime_defaults.max_queue_size,
+            ),
+            max_concurrent_requests=_from_env(
+                env,
+                "max_concurrent_requests",
+                int,
+                runtime_defaults.max_concurrent_requests,
+            ),
+            max_batch_tokens=_from_env(
+                env,
+                "max_batch_tokens",
+                int,
+                runtime_defaults.max_batch_tokens,
+            ),
+            request_timeout_s=_from_env(
+                env,
+                "request_timeout_s",
+                _parse_optional_float,
+                runtime_defaults.request_timeout_s,
             ),
             max_kv_cache_tokens=_from_env(
                 env,
@@ -194,6 +237,18 @@ def load_settings_from_env(env: Mapping[str, str] = os.environ) -> Settings:
                 "prefill_chunk_size",
                 _parse_optional_int,
                 runtime_defaults.prefill_chunk_size,
+            ),
+            enable_prefix_cache=_from_env(
+                env,
+                "enable_prefix_cache",
+                _parse_bool,
+                runtime_defaults.enable_prefix_cache,
+            ),
+            max_prefix_cache_entries=_from_env(
+                env,
+                "max_prefix_cache_entries",
+                int,
+                runtime_defaults.max_prefix_cache_entries,
             ),
         ),
     )
@@ -238,15 +293,27 @@ def parse_settings(
             "repetition_penalty",
             settings.runtime.repetition_penalty,
         ),
-        max_decode_batch_size=_override(
+        decode_batch_size=_override(
             args,
-            "max_decode_batch_size",
-            settings.runtime.max_decode_batch_size,
+            "decode_batch_size",
+            settings.runtime.decode_batch_size,
         ),
         decode_selection_window=_override(
             args,
             "decode_selection_window",
             settings.runtime.decode_selection_window,
+        ),
+        max_queue_size=_override(args, "max_queue_size", settings.runtime.max_queue_size),
+        max_concurrent_requests=_override(
+            args,
+            "max_concurrent_requests",
+            settings.runtime.max_concurrent_requests,
+        ),
+        max_batch_tokens=_override(args, "max_batch_tokens", settings.runtime.max_batch_tokens),
+        request_timeout_s=_override(
+            args,
+            "request_timeout_s",
+            settings.runtime.request_timeout_s,
         ),
         max_kv_cache_tokens=_override(
             args,
@@ -259,6 +326,16 @@ def parse_settings(
             args,
             "prefill_chunk_size",
             settings.runtime.prefill_chunk_size,
+        ),
+        enable_prefix_cache=_override(
+            args,
+            "enable_prefix_cache",
+            settings.runtime.enable_prefix_cache,
+        ),
+        max_prefix_cache_entries=_override(
+            args,
+            "max_prefix_cache_entries",
+            settings.runtime.max_prefix_cache_entries,
         ),
     )
     return Settings(server=server, runtime=runtime)

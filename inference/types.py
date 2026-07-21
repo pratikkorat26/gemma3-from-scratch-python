@@ -1,10 +1,10 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Union
 
 import torch
 
-from .config import SamplingConfig, SamplingParams
+from .config import SamplingConfig
 
 
 class RequestStatus(str, Enum):
@@ -12,14 +12,7 @@ class RequestStatus(str, Enum):
     ACTIVE = "active"
     FINISHED = "finished"
     ERROR = "error"
-
-
-class RequestPhase(str, Enum):
-    QUEUED = "queued"
-    PREFILL = "prefill"
-    DECODE = "decode"
-    FINISHED = "finished"
-    ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 class StopReason(str, Enum):
@@ -28,15 +21,9 @@ class StopReason(str, Enum):
     CONTEXT_LIMIT = "context_limit"
     CAPACITY_EXCEEDED = "capacity_exceeded"
     TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    QUEUE_FULL = "queue_full"
     ERROR = "error"
-
-
-class StreamEventKind(str, Enum):
-    TEXT = "text"
-    DONE = "done"
-
-
-LayerCache = Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]]
 
 
 @dataclass(frozen=True)
@@ -45,13 +32,7 @@ class GenerateRequest:
     prompt: str
     sampling: Optional[SamplingConfig] = None
     max_new_tokens: Optional[int] = None
-
-
-@dataclass(frozen=True)
-class ModelInfo:
-    model_id: str
-    context_length: int
-    device: str
+    timeout_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -60,11 +41,23 @@ class EngineStats:
     queued_requests: int = 0
     kv_blocks_total: int = 0
     kv_blocks_used: int = 0
+    prefill_batch_size: int = 0
+    decode_batch_size: int = 0
+    completed_requests: int = 0
+    cancelled_requests: int = 0
+    failed_requests: int = 0
+    queue_wait_ms: float = 0.0
+    prefill_latency_ms: float = 0.0
+    decode_step_latency_ms: float = 0.0
+    prefix_cache_enabled: bool = False
+    prefix_cache_entries: int = 0
+    prefix_cache_hits: int = 0
+    prefix_cache_misses: int = 0
 
 
 @dataclass
 class RequestState:
-    request_id: int
+    request_id: Union[int, str]
     prompt_token_ids: List[int]
     sampling: SamplingConfig
     max_new_tokens: int
@@ -72,31 +65,27 @@ class RequestState:
     generated_ids: List[int] = field(default_factory=list)
     all_token_ids: List[int] = field(default_factory=list)
     seen_token_ids: Set[int] = field(default_factory=set)
-    past_kv: LayerCache = None
     current_input: Optional[torch.Tensor] = None
-    text_chunks: List[str] = field(default_factory=list)
     block_table: List[int] = field(default_factory=list)
     prompt_cursor: int = 0
-    num_computed_tokens: int = 0
     live_kv_tokens: int = 0
     status: str = RequestStatus.QUEUED.value
     stop_reason: Optional[str] = None
     error_message: Optional[str] = None
-    sampling_seed: Optional[int] = None
     sampling_generator: Optional[torch.Generator] = None
     created_at_s: float = 0.0
+    deadline_s: Optional[float] = None
     first_scheduled_at_s: Optional[float] = None
     finished_at_s: Optional[float] = None
     prefill_time_s: float = 0.0
     prefill_steps: int = 0
     decode_time_s: float = 0.0
     decode_steps: int = 0
-    phase: str = RequestPhase.QUEUED.value
 
     @classmethod
     def from_prompt(
         cls,
-        request_id: int,
+        request_id: Union[int, str],
         prompt_token_ids: List[int],
         sampling: SamplingConfig,
         max_new_tokens: int,
@@ -121,8 +110,8 @@ class RequestState:
 
 
 @dataclass
-class GenerationResult:
-    request_id: int
+class GenerateResult:
+    request_id: Union[int, str]
     text: str
     token_ids: List[int]
     stop_reason: str
@@ -136,9 +125,6 @@ class GenerationResult:
     decode_steps: int = 0
 
 
-GenerateResult = GenerationResult
-
-
 @dataclass(frozen=True)
 class StreamEvent:
     kind: str
@@ -149,22 +135,12 @@ class StreamEvent:
     error_message: Optional[str] = None
 
 
-StreamGenerateEvent = StreamEvent
-
-
 __all__ = [
     "EngineStats",
     "GenerateRequest",
     "GenerateResult",
-    "GenerationResult",
-    "LayerCache",
-    "ModelInfo",
-    "RequestPhase",
     "RequestState",
     "RequestStatus",
-    "SamplingParams",
     "StopReason",
     "StreamEvent",
-    "StreamEventKind",
-    "StreamGenerateEvent",
 ]

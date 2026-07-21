@@ -8,7 +8,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from engine import EngineConfig, GemmaRuntime, LLMEngine, SamplingConfig, get_device
+from inference import EngineConfig, LLMEngine, SamplingConfig
+from runtime import GemmaRuntime, get_device
 
 
 def should_run_real_engine_tests() -> bool:
@@ -62,7 +63,7 @@ def get_shared_runtime() -> GemmaRuntime:
 def build_engine(
     *,
     max_new_tokens: int = 32,
-    max_decode_batch_size: int = 4,
+    decode_batch_size: int = 4,
 ) -> LLMEngine:
     runtime = get_shared_runtime()
     return LLMEngine(
@@ -71,7 +72,7 @@ def build_engine(
             choose_model="270m",
             use_instruct_model=False,
             max_new_tokens=max_new_tokens,
-            max_decode_batch_size=max_decode_batch_size,
+            decode_batch_size=decode_batch_size,
             sampling=SamplingConfig(
                 temperature=0.0,
                 top_p=1.0,

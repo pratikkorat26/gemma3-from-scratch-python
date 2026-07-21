@@ -4,7 +4,6 @@ from .types import (
     ChatCompletionRequest,
     ChatCompletionResult,
     ChatMessage,
-    ReadinessStatus,
     Usage,
 )
 
@@ -14,6 +13,5 @@ __all__ = [
     "ChatCompletionResult",
     "ChatCompletionService",
     "ChatMessage",
-    "ReadinessStatus",
     "Usage",
 ]

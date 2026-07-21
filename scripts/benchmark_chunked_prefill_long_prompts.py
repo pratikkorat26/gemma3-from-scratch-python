@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -9,7 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from engine import EngineConfig, GemmaRuntime, LLMEngine, SamplingConfig, get_device
+from inference import EngineConfig, GenerateRequest, LLMEngine, SamplingConfig
+from runtime import GemmaRuntime, get_device
 
 
 def build_engine(runtime: GemmaRuntime, *, prefill_chunk_size: Optional[int], max_new_tokens: int) -> LLMEngine:
@@ -89,7 +91,7 @@ def summarize_results(results, *, elapsed_s: float, label: str) -> None:
         )
 
 
-def run_case(
+async def run_case(
     runtime: GemmaRuntime,
     *,
     prompts: list[str],
@@ -105,7 +107,8 @@ def run_case(
             prefill_chunk_size=prefill_chunk_size,
             max_new_tokens=max_new_tokens,
         )
-        engine.generate_many(prompts)
+        await asyncio.gather(*[engine.generate(GenerateRequest(str(index), prompt)) for index, prompt in enumerate(prompts)])
+        await engine.shutdown()
 
     elapsed_values = []
     last_results = None
@@ -116,17 +119,18 @@ def run_case(
             max_new_tokens=max_new_tokens,
         )
         started = time.perf_counter()
-        results = engine.generate_many(prompts)
+        results = await asyncio.gather(*[engine.generate(GenerateRequest(str(index), prompt)) for index, prompt in enumerate(prompts)])
         elapsed_s = time.perf_counter() - started
         elapsed_values.append(elapsed_s)
         last_results = results
+        await engine.shutdown()
 
     avg_elapsed_s = sum(elapsed_values) / len(elapsed_values)
     summarize_results(last_results, elapsed_s=avg_elapsed_s, label=label)
     return avg_elapsed_s
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark long concurrent prompts with and without chunked prefill")
     parser.add_argument("--num-prompts", type=int, default=4, help="Number of concurrent long prompts")
     parser.add_argument("--repeat", type=int, default=40, help="How many times to repeat each long prompt seed")
@@ -146,7 +150,7 @@ def main() -> None:
     print(f"num_prompts={len(prompts)}")
     print(f"prompt_chars_first={len(prompts[0])}")
 
-    no_chunk_elapsed = run_case(
+    no_chunk_elapsed = await run_case(
         runtime,
         prompts=prompts,
         prefill_chunk_size=None,
@@ -155,7 +159,7 @@ def main() -> None:
         benchmark_runs=args.benchmark_runs,
         label="no_chunk",
     )
-    chunked_elapsed = run_case(
+    chunked_elapsed = await run_case(
         runtime,
         prompts=prompts,
         prefill_chunk_size=args.chunk_size,
@@ -173,4 +177,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

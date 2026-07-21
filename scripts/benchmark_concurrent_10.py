@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import time
 from statistics import mean
@@ -7,7 +8,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from engine import EngineConfig, GemmaRuntime, LLMEngine, SamplingConfig, get_device
+from inference import EngineConfig, GenerateRequest, LLMEngine, SamplingConfig
+from runtime import GemmaRuntime, get_device
 
 try:
     import pandas as pd
@@ -17,7 +19,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
-def main() -> None:
+async def main() -> None:
     runtime = GemmaRuntime(
         choose_model="270m",
         use_instruct_model=True,
@@ -51,7 +53,7 @@ def main() -> None:
         "Write one creative sentence that starts a sci-fi story on Mars.",
     ]
     start = time.perf_counter()
-    results = engine.generate_many(prompts)
+    results = await asyncio.gather(*[engine.generate(GenerateRequest(str(index), prompt)) for index, prompt in enumerate(prompts)])
     elapsed_s = time.perf_counter() - start
 
     ok = 0
@@ -59,7 +61,7 @@ def main() -> None:
     for result in results:
         if result.error_message is None:
             ok += 1
-        prompt = prompts[result.request_id]
+        prompt = prompts[int(result.request_id)]
         rows.append(
             {
                 "request_id": result.request_id,
@@ -96,7 +98,8 @@ def main() -> None:
         )
 
     print(f"\ncompleted={ok}/10 elapsed_s={elapsed_s:.3f}")
+    await engine.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

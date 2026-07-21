@@ -1,29 +1,7 @@
-import importlib.util
-import sys
 import unittest
-from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-OPENAI_API_DIR = REPO_ROOT / "openai_api"
-
-
-def _load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-settings_module = _load_module("runtime_settings_under_test", OPENAI_API_DIR / "settings.py")
-sys.path.insert(0, str(OPENAI_API_DIR))
-run_module = _load_module("runtime_run_under_test", OPENAI_API_DIR / "run.py")
-
-RuntimeSettings = settings_module.RuntimeSettings
-ServerSettings = settings_module.ServerSettings
-parse_settings = settings_module.parse_settings
-main = run_module.main
+from adapters.openai.run import main
+from config.settings import RuntimeSettings, ServerSettings, parse_settings
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -50,12 +28,18 @@ class RuntimeConfigTests(unittest.TestCase):
                 "GEMMA_API_TOP_P": "0.75",
                 "GEMMA_API_TOP_K": "20",
                 "GEMMA_API_REPETITION_PENALTY": "1.2",
-                "GEMMA_API_MAX_DECODE_BATCH_SIZE": "2",
                 "GEMMA_API_DECODE_SELECTION_WINDOW": "6",
+                "GEMMA_API_MAX_QUEUE_SIZE": "7",
+                "GEMMA_API_MAX_CONCURRENT_REQUESTS": "3",
+                "GEMMA_API_MAX_BATCH_TOKENS": "96",
+                "GEMMA_API_DECODE_BATCH_SIZE": "2",
+                "GEMMA_API_REQUEST_TIMEOUT_S": "12.5",
                 "GEMMA_API_MAX_KV_CACHE_TOKENS": "1024",
                 "GEMMA_API_KV_BLOCK_SIZE": "32",
                 "GEMMA_API_NUM_KV_BLOCKS": "8",
                 "GEMMA_API_PREFILL_CHUNK_SIZE": "128",
+                "GEMMA_API_ENABLE_PREFIX_CACHE": "true",
+                "GEMMA_API_MAX_PREFIX_CACHE_ENTRIES": "32",
             },
         )
 
@@ -72,12 +56,18 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(settings.runtime.top_p, 0.75)
         self.assertEqual(settings.runtime.top_k, 20)
         self.assertEqual(settings.runtime.repetition_penalty, 1.2)
-        self.assertEqual(settings.runtime.max_decode_batch_size, 2)
         self.assertEqual(settings.runtime.decode_selection_window, 6)
+        self.assertEqual(settings.runtime.max_queue_size, 7)
+        self.assertEqual(settings.runtime.max_concurrent_requests, 3)
+        self.assertEqual(settings.runtime.max_batch_tokens, 96)
+        self.assertEqual(settings.runtime.decode_batch_size, 2)
+        self.assertEqual(settings.runtime.request_timeout_s, 12.5)
         self.assertEqual(settings.runtime.max_kv_cache_tokens, 1024)
         self.assertEqual(settings.runtime.kv_block_size, 32)
         self.assertEqual(settings.runtime.num_kv_blocks, 8)
         self.assertEqual(settings.runtime.prefill_chunk_size, 128)
+        self.assertTrue(settings.runtime.enable_prefix_cache)
+        self.assertEqual(settings.runtime.max_prefix_cache_entries, 32)
 
     def test_cli_overrides_env(self):
         settings = parse_settings(
@@ -94,6 +84,13 @@ class RuntimeConfigTests(unittest.TestCase):
                 "33",
                 "--temperature",
                 "0.2",
+                "--decode-batch-size",
+                "5",
+                "--request-timeout-s",
+                "1.5",
+                "--enable-prefix-cache",
+                "--max-prefix-cache-entries",
+                "16",
                 "--num-kv-blocks",
                 "none",
             ],
@@ -105,6 +102,8 @@ class RuntimeConfigTests(unittest.TestCase):
                 "GEMMA_API_USE_INSTRUCT_MODEL": "true",
                 "GEMMA_API_DEFAULT_MAX_TOKENS": "64",
                 "GEMMA_API_TEMPERATURE": "0.5",
+                "GEMMA_API_DECODE_BATCH_SIZE": "8",
+                "GEMMA_API_REQUEST_TIMEOUT_S": "9.0",
                 "GEMMA_API_NUM_KV_BLOCKS": "8",
             },
         )
@@ -116,6 +115,10 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertFalse(settings.runtime.use_instruct_model)
         self.assertEqual(settings.runtime.default_max_tokens, 33)
         self.assertEqual(settings.runtime.temperature, 0.2)
+        self.assertEqual(settings.runtime.decode_batch_size, 5)
+        self.assertEqual(settings.runtime.request_timeout_s, 1.5)
+        self.assertTrue(settings.runtime.enable_prefix_cache)
+        self.assertEqual(settings.runtime.max_prefix_cache_entries, 16)
         self.assertIsNone(settings.runtime.num_kv_blocks)
 
     def test_invalid_env_bool_reports_variable_name(self):

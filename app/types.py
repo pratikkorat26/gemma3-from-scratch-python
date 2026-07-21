@@ -56,9 +56,3 @@ class ChatCompletionEvent:
     usage: Optional[Usage] = None
     done: bool = False
     error: Optional[dict] = None
-
-
-@dataclass(frozen=True)
-class ReadinessStatus:
-    ready: bool
-    detail: str = "ready"

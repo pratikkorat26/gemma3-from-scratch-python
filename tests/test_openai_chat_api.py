@@ -1,9 +1,11 @@
+import logging
 import unittest
 
 try:
+    from app.types import ChatCompletionEvent, ChatCompletionResult, Usage
     from fastapi.testclient import TestClient
-    from openai_api.app import create_app
-    from openai_api.schemas import SUPPORTED_MODEL
+    from adapters.openai.routes import create_app
+    from adapters.openai.schemas import SUPPORTED_MODEL
     FASTAPI_AVAILABLE = True
 except ModuleNotFoundError:
     FASTAPI_AVAILABLE = False
@@ -13,31 +15,22 @@ class FakeChatService:
     def __init__(self):
         self.requests_total = 0
 
-    def create_chat_completion(self, request):
+    async def create(self, request):
         self.requests_total += 1
-        return {
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "created": 0,
-            "model": SUPPORTED_MODEL,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hello"},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
-        }
+        return ChatCompletionResult(
+            request_id="chatcmpl-test", model=SUPPORTED_MODEL, content="hello",
+            finish_reason="stop", usage=Usage(10, 1, 11), created=0,
+        )
 
-    def stream_chat_completion(self, request):
+    async def stream(self, request):
         self.requests_total += 1
-        yield 'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
-        yield 'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}\n\n'
-        if getattr(getattr(request, "stream_options", None), "include_usage", False):
-            yield 'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}\n\n'
-        yield 'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
-        yield "data: [DONE]\n\n"
+        common = {"request_id": "chatcmpl-test", "model": SUPPORTED_MODEL, "created": 0}
+        yield ChatCompletionEvent(**common, role="assistant")
+        yield ChatCompletionEvent(**common, content="hello")
+        if request.include_usage:
+            yield ChatCompletionEvent(**common, usage=Usage(10, 1, 11))
+        yield ChatCompletionEvent(**common, finish_reason="stop")
+        yield ChatCompletionEvent(**common, done=True)
 
     def list_models(self):
         return {
@@ -198,12 +191,16 @@ class OpenAIChatAPIStartupFailureTests(unittest.TestCase):
         def failing_service_factory():
             raise RuntimeError("model init failed")
 
+        self.logger = logging.getLogger("adapters.openai")
+        self.previous_logger_disabled = self.logger.disabled
+        self.logger.disabled = True
         self.app = create_app(service_factory=failing_service_factory)
         self.client_cm = TestClient(self.app)
         self.client = self.client_cm.__enter__()
 
     def tearDown(self):
         self.client_cm.__exit__(None, None, None)
+        self.logger.disabled = self.previous_logger_disabled
 
     def test_readyz_reports_startup_failure(self):
         response = self.client.get("/readyz")

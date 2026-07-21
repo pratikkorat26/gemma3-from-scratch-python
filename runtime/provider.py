@@ -5,7 +5,6 @@ from typing import Dict, Optional
 import torch
 
 from gemma3.model import GEMMA3_CONFIG_270M, build_gemma3_270m
-from gemma3.tokenizer import apply_chat_template
 from gemma3.utilities import load_weights_into_gemma
 
 
@@ -138,36 +137,3 @@ class GemmaRuntime:
         self.tokenizer = GemmaTokenizer(tokenizer_path)
 
         self.model.eval()
-
-
-class GemmaRuntimeProvider:
-    def __init__(
-        self,
-        choose_model: str = "270m",
-        use_instruct_model: bool = True,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        self.choose_model = choose_model
-        self.use_instruct_model = use_instruct_model
-        self.device = device
-        self._runtime: Optional[GemmaRuntime] = None
-
-    def load(self) -> GemmaRuntime:
-        if self._runtime is None:
-            self._runtime = GemmaRuntime(
-                choose_model=self.choose_model,
-                use_instruct_model=self.use_instruct_model,
-                device=self.device,
-            )
-        return self._runtime
-
-    def ready(self) -> bool:
-        return self._runtime is not None
-
-    def warmup(self):
-        runtime = self.load()
-        return {
-            "model_id": runtime.repo_id,
-            "context_length": runtime.model.context_length,
-            "device": str(runtime.device),
-        }

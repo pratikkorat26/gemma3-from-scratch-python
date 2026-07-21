@@ -52,14 +52,14 @@ python main.py
 OpenAI-like API server:
 
 ```bash
-python -m openai_api.run
+python -m adapters.openai.run
 ```
 
 The API binds to `127.0.0.1:8000` by default. Use CLI flags or `GEMMA_API_*` environment variables to tune it:
 
 ```bash
-python -m openai_api.run --host 0.0.0.0 --port 8080 --device cpu --default-max-tokens 64
-GEMMA_API_MAX_KV_CACHE_TOKENS=65536 python -m openai_api.run
+python -m adapters.openai.run --host 0.0.0.0 --port 8080 --device cpu --default-max-tokens 64
+GEMMA_API_MAX_KV_CACHE_TOKENS=65536 python -m adapters.openai.run
 ```
 
 Query the API:
@@ -71,13 +71,11 @@ python query_fastapi.py --stream --prompt "Give me one short line about LLM infe
 ## Project Structure
 
 - `gemma3/`: model components, paged KV storage, RoPE, feedforward, tokenizer template, and weights mapping
-- `inference/`: deep inference core: engine contract, generation types, scheduler, KV allocation, sampling, and batching policy
+- `inference/`: async engine facade, paged model executor, request scheduler, KV allocation, sampling, and batching policies
 - `runtime/`: model/tokenizer loading, device resolution, runtime provider, and warmup boundary
 - `app/`: serving/application layer: request validation, readiness, metrics, logging, and chat completion orchestration
 - `adapters/openai/`: FastAPI/OpenAI compatibility adapter: schemas, routes, mapping, SSE, and HTTP errors
-- `adapters/prometheus/`: metrics formatting adapter
 - `config/`: typed runtime/server settings and environment/CLI parsing
-- `engine/` and `openai_api/`: compatibility facades for older imports
 - `main.py`: direct local generation flow
 - `tests/`: scheduler and API response-shape tests
 
@@ -100,19 +98,38 @@ The scheduler now allocates KV memory in blocks as requests grow, rather than re
 - `max_kv_cache_tokens`: total KV token budget available to the engine
 - `kv_block_size`: size of each KV allocation block
 - `num_kv_blocks`: optional explicit number of blocks; if omitted, it is derived from `max_kv_cache_tokens // kv_block_size`
+- `enable_prefix_cache`: opt-in prompt-prefix KV cache (default `false`)
+- `max_prefix_cache_entries`: maximum number of cached prefixes when prefix caching is enabled (default `64`)
+- `max_queue_size`: maximum in-flight requests owned by the online scheduler
+- `max_concurrent_requests`: maximum active requests admitted for model execution
+- `decode_batch_size`: maximum online decode batch size
+- `max_batch_tokens`: maximum token count in a decode batch
+- `request_timeout_s`: optional per-request timeout default
 
 This keeps the engine readable while matching the basic vLLM-style idea: admit requests cheaply, grow cache usage incrementally, and free blocks immediately when a request finishes.
+
+When `enable_prefix_cache` is `true`, completed prompt prefixes are stored in a reference-counted cache. Subsequent requests with a matching prefix reuse the cached KV blocks and skip the corresponding prefill work. Reuse is performed at whole-block granularity, and cached blocks remain allocated until the entry is evicted by LRU or the process exits. The cache is keyed by a `scope` string that is currently hard-coded to `"default"`; this is the seam for future tenant isolation.
+
+The public engine API is asynchronous and request-oriented:
+
+- `await generate(request) -> GenerateResult`
+- `stream(request) -> AsyncIterator[StreamEvent]`
+- `await abort(request_id) -> None`
+- `stats() -> EngineStats`
+- `await shutdown() -> None`
+
+`LLMEngine` is a thin composition facade. `AsyncScheduler` owns admission, queues, cancellation, deadlines, streaming, and metrics; `PagedModelExecutor` exclusively owns synchronous model, sampling, and KV-cache mutation. Both run on the ASGI event loop, so model steps remain serialized per process.
 
 ## API Operations
 
 - `GET /healthz`: lightweight liveness probe
 - `GET /readyz`: readiness probe; returns `200` only after `ChatCompletionService` has loaded successfully
 - `GET /v1/models`: OpenAI-style local model listing
-- `GET /stats`: JSON request/token/latency counters
-- `GET /metrics`: dependency-free Prometheus-style text metrics
+- `GET /stats`: JSON request/token/latency counters, plus prefix-cache state (`prefix_cache_enabled`, `prefix_cache_entries`, `prefix_cache_hits`, `prefix_cache_misses`)
+- `GET /metrics`: dependency-free Prometheus-style text metrics, including `gemma_prefix_cache_*` counters when prefix caching is enabled
 - `POST /v1/chat/completions`: returns `503` if service startup failed or is not yet complete
 
-The API initializes `ChatCompletionService` during app startup, serializes access to the shared engine per process, enforces request/message size limits, and returns generic client-facing errors while logging details server-side.
+The API initializes `ChatCompletionService` during startup, awaits the shared async engine, shuts it down during application teardown, enforces request/message size limits, and returns generic client-facing errors while logging details server-side.
 
 Supported chat request controls include `max_tokens`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`, `stop`, `stream`, and `stream_options.include_usage`.
 
@@ -120,7 +137,7 @@ Supported chat request controls include `max_tokens`, `temperature`, `top_p`, `t
 
 ```mermaid
 flowchart TD
-    A[Client] --> B[FastAPI app: openai_api/app.py]
+    A[Client] --> B[FastAPI app: adapters/openai/routes.py]
     B --> C[startup: build ChatCompletionService]
     B --> D[GET /healthz]
     B --> E[GET /readyz]
@@ -129,9 +146,9 @@ flowchart TD
     F -->|stream=true| H[stream_chat_completion]
     G --> I[messages_to_gemma_prompt]
     H --> I
-    I --> J[LLMEngine.generate_many / generate_stream]
-    J --> K[_build_request -> _init_request]
-    K --> L[prefill: allocate KV blocks and run one step]
+    I --> J[LLMEngine.generate / stream]
+    J --> K[AsyncScheduler admission]
+    K --> L[PagedModelExecutor prefill + prefix cache]
     L --> M[model forward with shared paged KV caches]
     M --> N[sample_next_token + repetition penalty]
     N --> O{stop? eos / max_new_tokens / context_limit / capacity}

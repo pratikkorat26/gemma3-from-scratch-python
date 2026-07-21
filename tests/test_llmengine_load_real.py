@@ -3,6 +3,7 @@ import os
 import statistics
 import sys
 import time
+import asyncio
 import unittest
 from pathlib import Path
 
@@ -13,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(TESTS_ROOT))
 
-from engine.config import SamplingConfig
+from inference import GenerateRequest, SamplingConfig
 from real_engine_test_utils import build_engine, real_engine_skip_reason
 
 
@@ -68,13 +69,20 @@ def _prompt_bank():
 
 
 @unittest.skipIf(bool(real_engine_skip_reason(load_test=True)), real_engine_skip_reason(load_test=True))
-class LLMEngineRealLoadTests(unittest.TestCase):
+class LLMEngineRealLoadTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.engine = build_engine(max_new_tokens=24, max_decode_batch_size=4)
+        cls.engine = build_engine(max_new_tokens=24, decode_batch_size=4)
         cls.thresholds = _load_thresholds()
 
-    def test_concurrency_sweep_stability(self):
+    @classmethod
+    def tearDownClass(cls):
+        return None
+
+    async def asyncTearDown(self):
+        await self.engine.shutdown()
+
+    async def test_concurrency_sweep_stability(self):
         concurrency_levels = [4 * 2, 8 * 2, 16 * 2]
         bank = _prompt_bank()
         summaries = []
@@ -82,11 +90,10 @@ class LLMEngineRealLoadTests(unittest.TestCase):
         for level in concurrency_levels:
             prompts = [f"{bank[idx % len(bank)]} [{idx}]" for idx in range(level)]
             started = time.perf_counter()
-            results = self.engine.generate_many(
-                prompts,
-                sampling=_sampling(),
-                max_new_tokens=24,
-            )
+            results = await asyncio.gather(*[
+                self.engine.generate(GenerateRequest(str(index), prompt, _sampling(), 24))
+                for index, prompt in enumerate(prompts)
+            ])
             elapsed_s = time.perf_counter() - started
 
             errors = [result for result in results if result.error_message is not None]

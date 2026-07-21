@@ -8,7 +8,6 @@ from app import ChatCompletionService
 from app.errors import AppError
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
-from starlette.concurrency import run_in_threadpool
 
 from .errors import APIError, app_error_to_api_error, error_response
 from .mapper import chat_completion_to_openai, to_app_request
@@ -51,6 +50,9 @@ def create_app(
                 fastapi_app.state.startup_error = str(exc) or exc.__class__.__name__
                 LOGGER.exception("service startup failed")
         yield
+        service = getattr(fastapi_app.state, "service", None)
+        if service is not None and hasattr(service, "shutdown"):
+            await service.shutdown()
 
     fastapi_app = FastAPI(
         title="Gemma OpenAI-like API",
@@ -139,21 +141,15 @@ def create_app(
         try:
             app_request = to_app_request(payload)
             if payload.stream:
-                if not hasattr(service, "stream") and hasattr(service, "stream_chat_completion"):
-                    return StreamingResponse(
-                        service.stream_chat_completion(payload),
-                        media_type="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-                    )
+                async def sse_events():
+                    async for event in service.stream(app_request):
+                        yield event_to_sse(event)
                 return StreamingResponse(
-                    (event_to_sse(event) for event in service.stream(app_request)),
+                    sse_events(),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
-            if not hasattr(service, "create") and hasattr(service, "create_chat_completion"):
-                response = await run_in_threadpool(service.create_chat_completion, payload)
-                return JSONResponse(response)
-            result = await run_in_threadpool(service.create, app_request)
+            result = await service.create(app_request)
             return JSONResponse(chat_completion_to_openai(result))
         except AppError as exc:
             api_error = app_error_to_api_error(exc)

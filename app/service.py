@@ -1,12 +1,11 @@
 import json
 import logging
-import threading
 import time
 import uuid
-from typing import Iterator, List, Optional, Tuple
+from typing import AsyncIterator, List, Optional, Tuple
 
 from config.settings import RuntimeSettings
-from inference import EngineConfig, LLMEngine, SamplingConfig
+from inference import EngineConfig, GenerateRequest, LLMEngine, SamplingConfig
 from runtime import GemmaRuntime, resolve_device
 
 from .errors import AppError
@@ -76,16 +75,21 @@ class ChatCompletionService:
                 use_instruct_model=False,
                 max_new_tokens=self.default_max_tokens,
                 sampling=self.default_sampling,
-                max_decode_batch_size=int(_config_value(config, "max_decode_batch_size", 4)),
+                decode_batch_size=int(_config_value(config, "decode_batch_size", 4)),
                 decode_selection_window=int(_config_value(config, "decode_selection_window", 8)),
+                max_queue_size=int(_config_value(config, "max_queue_size", 128)),
+                max_concurrent_requests=int(_config_value(config, "max_concurrent_requests", 16)),
+                max_batch_tokens=int(_config_value(config, "max_batch_tokens", 256)),
+                request_timeout_s=_config_value(config, "request_timeout_s", None),
                 max_kv_cache_tokens=int(_config_value(config, "max_kv_cache_tokens", 32_768)),
                 kv_block_size=int(_config_value(config, "kv_block_size", 16)),
                 num_kv_blocks=_config_value(config, "num_kv_blocks", None),
                 prefill_chunk_size=_config_value(config, "prefill_chunk_size", None),
+                enable_prefix_cache=bool(_config_value(config, "enable_prefix_cache", False)),
+                max_prefix_cache_entries=int(_config_value(config, "max_prefix_cache_entries", 64)),
             ),
         )
         self.metrics = ServiceMetrics(model=self.model_name)
-        self._engine_lock = threading.Lock()
 
     def _validate_request(self, request: ChatCompletionRequest) -> None:
         if request.max_tokens is not None and request.max_tokens > self.max_request_tokens:
@@ -126,23 +130,64 @@ class ChatCompletionService:
         }
 
     def stats(self) -> dict:
-        return self.metrics.snapshot()
+        snapshot = self.metrics.snapshot()
+        if hasattr(self.engine, "stats"):
+            engine_stats = self.engine.stats()
+            snapshot["scheduler"] = {
+                "queue_size": engine_stats.queued_requests,
+                "active_requests": engine_stats.active_requests,
+                "prefill_batch_size": engine_stats.prefill_batch_size,
+                "decode_batch_size": engine_stats.decode_batch_size,
+                "queue_wait_ms": engine_stats.queue_wait_ms,
+                "prefill_latency_ms": engine_stats.prefill_latency_ms,
+                "decode_step_latency_ms": engine_stats.decode_step_latency_ms,
+                "completed_requests": engine_stats.completed_requests,
+                "cancelled_requests": engine_stats.cancelled_requests,
+                "failed_requests": engine_stats.failed_requests,
+                "prefix_cache_enabled": engine_stats.prefix_cache_enabled,
+                "prefix_cache_entries": engine_stats.prefix_cache_entries,
+                "prefix_cache_hits": engine_stats.prefix_cache_hits,
+                "prefix_cache_misses": engine_stats.prefix_cache_misses,
+            }
+        return snapshot
 
     def metrics_text(self) -> str:
         snapshot = self.metrics.snapshot()
         model = snapshot["model"]
-        return "\n".join(
-            [
-                "# HELP gemma_requests_total Total chat completion requests.",
-                "# TYPE gemma_requests_total counter",
-                f'gemma_requests_total{{model="{model}"}} {snapshot["requests_total"]}',
-                f'gemma_requests_failed_total{{model="{model}"}} {snapshot["requests_failed"]}',
-                f'gemma_prompt_tokens_total{{model="{model}"}} {snapshot["tokens_prompt_total"]}',
-                f'gemma_completion_tokens_total{{model="{model}"}} {snapshot["tokens_completion_total"]}',
-                f'gemma_generation_last_latency_seconds{{model="{model}"}} {snapshot["latency_s"]["last"]}',
-                "",
-            ]
-        )
+        lines = [
+            "# HELP gemma_requests_total Total chat completion requests.",
+            "# TYPE gemma_requests_total counter",
+            f'gemma_requests_total{{model="{model}"}} {snapshot["requests_total"]}',
+            f'gemma_requests_failed_total{{model="{model}"}} {snapshot["requests_failed"]}',
+            f'gemma_prompt_tokens_total{{model="{model}"}} {snapshot["tokens_prompt_total"]}',
+            f'gemma_completion_tokens_total{{model="{model}"}} {snapshot["tokens_completion_total"]}',
+            f'gemma_generation_last_latency_seconds{{model="{model}"}} {snapshot["latency_s"]["last"]}',
+        ]
+        if hasattr(self.engine, "stats"):
+            engine_stats = self.engine.stats()
+            lines.extend(
+                [
+                    f'gemma_scheduler_queue_size{{model="{model}"}} {engine_stats.queued_requests}',
+                    f'gemma_scheduler_active_requests{{model="{model}"}} {engine_stats.active_requests}',
+                    f'gemma_scheduler_prefill_batch_size{{model="{model}"}} {engine_stats.prefill_batch_size}',
+                    f'gemma_scheduler_decode_batch_size{{model="{model}"}} {engine_stats.decode_batch_size}',
+                    f'gemma_scheduler_queue_wait_ms{{model="{model}"}} {engine_stats.queue_wait_ms}',
+                    f'gemma_scheduler_prefill_latency_ms{{model="{model}"}} {engine_stats.prefill_latency_ms}',
+                    f'gemma_scheduler_decode_step_latency_ms{{model="{model}"}} {engine_stats.decode_step_latency_ms}',
+                    f'gemma_scheduler_completed_requests{{model="{model}"}} {engine_stats.completed_requests}',
+                    f'gemma_scheduler_cancelled_requests{{model="{model}"}} {engine_stats.cancelled_requests}',
+                    f'gemma_scheduler_failed_requests{{model="{model}"}} {engine_stats.failed_requests}',
+                    f'gemma_prefix_cache_enabled{{model="{model}"}} {int(engine_stats.prefix_cache_enabled)}',
+                    f'gemma_prefix_cache_entries{{model="{model}"}} {engine_stats.prefix_cache_entries}',
+                    f'gemma_prefix_cache_hits{{model="{model}"}} {engine_stats.prefix_cache_hits}',
+                    f'gemma_prefix_cache_misses{{model="{model}"}} {engine_stats.prefix_cache_misses}',
+                ]
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    async def shutdown(self) -> None:
+        await self.engine.shutdown()
 
     def _log_completion(self, *, usage: Usage, finish_reason: str, result, stream: bool) -> None:
         LOGGER.info(
@@ -172,16 +217,18 @@ class ChatCompletionService:
             total_tokens=prompt_tokens + completion_tokens,
         )
 
-    def create(self, request: ChatCompletionRequest) -> ChatCompletionResult:
+    async def create(self, request: ChatCompletionRequest) -> ChatCompletionResult:
         self._validate_request(request)
-        with self._engine_lock:
-            prompt = messages_to_gemma_prompt(request.messages)
-            result = self.engine.generate_many(
-                prompts=[prompt],
+        prompt = messages_to_gemma_prompt(request.messages)
+        result = await self.engine.generate(
+            GenerateRequest(
+                request_id=_completion_id(),
+                prompt=prompt,
                 sampling=request.sampling,
                 max_new_tokens=request.max_tokens,
-            )[0]
-            self._raise_for_result_error(result)
+            )
+        )
+        self._raise_for_result_error(result)
 
         text, stopped_by_sequence = _trim_stop(result.text, request.stop)
         finish_reason = "stop" if stopped_by_sequence else _finish_reason(result.stop_reason)
@@ -189,7 +236,7 @@ class ChatCompletionService:
         self.metrics.record_generation(usage=usage, result=result, stream=False)
         self._log_completion(usage=usage, finish_reason=finish_reason, result=result, stream=False)
         return ChatCompletionResult(
-            request_id=_completion_id(),
+            request_id=str(result.request_id),
             model=self.model_name,
             content=text,
             finish_reason=finish_reason,
@@ -197,7 +244,7 @@ class ChatCompletionService:
             created=_now_unix(),
         )
 
-    def stream(self, request: ChatCompletionRequest) -> Iterator[ChatCompletionEvent]:
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionEvent]:
         self._validate_request(request)
         completion_id = _completion_id()
         created = _now_unix()
@@ -214,65 +261,68 @@ class ChatCompletionService:
             created=created,
             role="assistant",
         )
-        with self._engine_lock:
-            try:
-                for event in self.engine.generate_stream_events(
+        try:
+            async for event in self.engine.stream(
+                GenerateRequest(
+                    request_id=completion_id,
                     prompt=prompt,
                     sampling=request.sampling,
                     max_new_tokens=request.max_tokens,
-                ):
-                    if event.kind == "text":
-                        if not event.text:
-                            continue
-                        completion_tokens += getattr(event, "token_count", 1) or 1
-                        accumulated_text += event.text
-                        text = event.text
-                        stopped_by_sequence = False
-                        if request.stop:
-                            stop_index = _first_stop_index(accumulated_text, request.stop)
-                            if stop_index is not None:
-                                emitted_before_chunk = len(accumulated_text) - len(event.text)
-                                text = accumulated_text[emitted_before_chunk:stop_index]
-                                stopped_by_sequence = True
-                                final_stop_reason = "stop"
-                        if text:
-                            yield ChatCompletionEvent(
-                                request_id=completion_id,
-                                model=self.model_name,
-                                created=created,
-                                content=text,
-                            )
-                        if stopped_by_sequence:
-                            break
+                )
+            ):
+                if event.kind == "text":
+                    if not event.text:
                         continue
-
-                    final_stop_reason = event.stop_reason or "eos"
-                    if event.error_message is not None:
-                        failed = True
+                    completion_tokens += getattr(event, "token_count", 1) or 1
+                    accumulated_text += event.text
+                    text = event.text
+                    stopped_by_sequence = False
+                    if request.stop:
+                        stop_index = _first_stop_index(accumulated_text, request.stop)
+                        if stop_index is not None:
+                            emitted_before_chunk = len(accumulated_text) - len(event.text)
+                            text = accumulated_text[emitted_before_chunk:stop_index]
+                            stopped_by_sequence = True
+                            final_stop_reason = "stop"
+                    if text:
                         yield ChatCompletionEvent(
                             request_id=completion_id,
                             model=self.model_name,
                             created=created,
-                            error={
-                                "message": "model execution failed",
-                                "type": "server_error",
-                                "code": event.stop_reason or "runtime_error",
-                            },
+                            content=text,
                         )
+                    if stopped_by_sequence:
+                        await self.engine.abort(completion_id)
                         break
-            except Exception:
-                failed = True
-                LOGGER.exception("streaming chat completion failed")
-                yield ChatCompletionEvent(
-                    request_id=completion_id,
-                    model=self.model_name,
-                    created=created,
-                    error={
-                        "message": "model execution failed",
-                        "type": "server_error",
-                        "code": "runtime_error",
-                    },
-                )
+                    continue
+
+                final_stop_reason = event.stop_reason or "eos"
+                if event.error_message is not None:
+                    failed = True
+                    yield ChatCompletionEvent(
+                        request_id=completion_id,
+                        model=self.model_name,
+                        created=created,
+                        error={
+                            "message": "model execution failed",
+                            "type": "server_error",
+                            "code": event.stop_reason or "runtime_error",
+                        },
+                    )
+                    break
+        except Exception:
+            failed = True
+            LOGGER.exception("streaming chat completion failed")
+            yield ChatCompletionEvent(
+                request_id=completion_id,
+                model=self.model_name,
+                created=created,
+                error={
+                    "message": "model execution failed",
+                    "type": "server_error",
+                    "code": "runtime_error",
+                },
+            )
 
         usage = self._usage(prompt, completion_tokens=completion_tokens)
         elapsed_s = time.perf_counter() - started

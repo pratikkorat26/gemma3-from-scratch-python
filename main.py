@@ -1,8 +1,10 @@
+import asyncio
 from dataclasses import dataclass
 
 import torch
 
-from engine import EngineConfig, GemmaRuntime, LLMEngine, SamplingConfig, get_device
+from inference import EngineConfig, GenerateRequest, LLMEngine, SamplingConfig
+from runtime import GemmaRuntime, get_device
 
 
 @dataclass(frozen=True)
@@ -21,7 +23,7 @@ def calc_gpu_gb(num_bytes: int) -> str:
     return f"{num_bytes / 1024 / 1024 / 1024:.2f} GB"
 
 
-def main() -> None:
+async def _main() -> None:
     run = RunConfig()
     sampling = SamplingConfig(
         temperature=run.temperature,
@@ -44,21 +46,21 @@ def main() -> None:
         ),
     )
 
-    input_token_ids = engine._encode_prompt(run.prompt)
-    print(runtime.tokenizer.decode(input_token_ids))
+    print(run.prompt)
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    for text in engine.generate_stream(
-        run.prompt,
-        sampling=sampling,
-        max_new_tokens=run.max_new_tokens,
-    ):
-        print(text, end="", flush=True)
+    async for event in engine.stream(GenerateRequest("cli", run.prompt, sampling, run.max_new_tokens)):
+        if event.kind == "text": print(event.text, end="", flush=True)
+    await engine.shutdown()
 
     if torch.cuda.is_available():
         print(f"\n\nGPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
+
+
+def main() -> None:
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":

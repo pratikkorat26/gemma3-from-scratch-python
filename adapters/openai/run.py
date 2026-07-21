@@ -1,7 +1,4 @@
-try:
-    from .settings import parse_settings
-except ImportError:
-    from settings import parse_settings
+from config.settings import parse_settings
 
 
 def main(argv=None, env=None, runner=None, app_factory=None, service_cls=None) -> None:
@@ -10,20 +7,13 @@ def main(argv=None, env=None, runner=None, app_factory=None, service_cls=None) -
 
         runner = uvicorn.run
     if app_factory is None:
-        try:
-            from .app import create_app
-        except ImportError:
-            from app import create_app
+        from .routes import create_app
 
         app_factory = create_app
     if service_cls is None:
-        try:
-            from .service import ChatCompletionService
-        except ImportError:
-            from service import ChatCompletionService
+        from app import ChatCompletionService
 
         service_cls = ChatCompletionService
-
     settings = parse_settings(argv=argv, env=env) if env is not None else parse_settings(argv=argv)
     app = app_factory(service_factory=lambda: service_cls(config=settings.runtime))
     runner(
