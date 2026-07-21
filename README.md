@@ -47,12 +47,14 @@ Direct generation:
 
 ```bash
 python main.py
+# or: gemma3-generate
 ```
 
 OpenAI-like API server:
 
 ```bash
 python -m adapters.openai.run
+# or: gemma3-serve
 ```
 
 The API binds to `127.0.0.1:8000` by default. Use CLI flags or `GEMMA_API_*` environment variables to tune it:
@@ -72,12 +74,13 @@ python query_fastapi.py --stream --prompt "Give me one short line about LLM infe
 
 - `gemma3/`: model components, paged KV storage, RoPE, feedforward, tokenizer template, and weights mapping
 - `inference/`: async engine facade, paged model executor, request scheduler, KV allocation, sampling, and batching policies
-- `runtime/`: model/tokenizer loading, device resolution, runtime provider, and warmup boundary
-- `app/`: serving/application layer: request validation, readiness, metrics, logging, and chat completion orchestration
+- `runtime/`: model/tokenizer loading, device resolution, and runtime provider
+- `app/`: serving/application layer: request validation, metrics, logging, and chat completion orchestration
 - `adapters/openai/`: FastAPI/OpenAI compatibility adapter: schemas, routes, mapping, SSE, and HTTP errors
 - `config/`: typed runtime/server settings and environment/CLI parsing
 - `main.py`: direct local generation flow
-- `tests/`: scheduler and API response-shape tests
+- `scripts/`: chunked-prefill demos and concurrency benchmarks
+- `tests/`: architecture boundaries, engine contracts, continuous batching, prefix cache, OpenAI API shapes, and opt-in real-engine suites
 
 ## Architecture Boundaries
 
@@ -104,9 +107,10 @@ The scheduler now allocates KV memory in blocks as requests grow, rather than re
 - `max_concurrent_requests`: maximum active requests admitted for model execution
 - `decode_batch_size`: maximum online decode batch size
 - `max_batch_tokens`: maximum token count in a decode batch
+- `prefill_chunk_size`: optional max tokens per prefill step (`None` = whole remaining prompt)
 - `request_timeout_s`: optional per-request timeout default
 
-This keeps the engine readable while matching the basic vLLM-style idea: admit requests cheaply, grow cache usage incrementally, and free blocks immediately when a request finishes.
+This keeps the engine readable while matching the basic vLLM-style idea: admit requests cheaply, grow cache usage incrementally, and free blocks immediately when a request finishes. Continuous batching is decode-centric: prefill runs one request at a time (optionally chunked), then decode cohorts share a step.
 
 When `enable_prefix_cache` is `true`, completed prompt prefixes are stored in a reference-counted cache. Subsequent requests with a matching prefix reuse the cached KV blocks and skip the corresponding prefill work. Reuse is performed at whole-block granularity, and cached blocks remain allocated until the entry is evicted by LRU or the process exits. The cache is keyed by a `scope` string that is currently hard-coded to `"default"`; this is the seam for future tenant isolation.
 
@@ -162,10 +166,11 @@ flowchart TD
 ## Validation
 
 ```bash
-python -m unittest discover -s tests -q
+python -m pytest -q
+# or: python -m unittest discover -s tests -q
 ```
 
-Scheduler tests cover round-robin decode ordering, paged KV isolation between requests, and block-capacity reuse / deferral.
+Tests cover import boundaries, the `InferenceEngine` contract, continuous batching / decode cohort selection, paged KV isolation and capacity reuse, prefix-cache unit + integration behavior, OpenAI response shapes, and runtime config parsing.
 
 Real `LLMEngine` regression tests (uses actual model/runtime, opt-in):
 

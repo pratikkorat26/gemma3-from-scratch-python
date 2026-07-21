@@ -273,7 +273,7 @@ class ChatCompletionService:
                 if event.kind == "text":
                     if not event.text:
                         continue
-                    completion_tokens += getattr(event, "token_count", 1) or 1
+                    completion_tokens = event.generated_token_count or (completion_tokens + 1)
                     accumulated_text += event.text
                     text = event.text
                     stopped_by_sequence = False

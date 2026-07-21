@@ -38,10 +38,6 @@ class KVBlockManager:
             self._prefix_cache = PrefixCache(max_entries=max_prefix_cache_entries)
 
     @property
-    def reserved_tokens(self) -> int:
-        return self._allocated_blocks * self.block_size
-
-    @property
     def allocated_blocks(self) -> int:
         return self._allocated_blocks
 

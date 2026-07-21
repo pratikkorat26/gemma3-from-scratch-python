@@ -109,14 +109,20 @@ class PagedModelExecutor:
             request.current_input = self._next_prefill_chunk(request)
         if request.current_input is None:
             return False
+        chunk_len = int(request.current_input.shape[1])
+        finishes_prompt = request.prompt_cursor + chunk_len >= len(request.prompt_token_ids)
         started = time.perf_counter()
-        logits = self._forward([request], defer_on_capacity=False)
+        logits = self._forward(
+            [request],
+            defer_on_capacity=False,
+            compute_logits=finishes_prompt,
+        )
         if request.status in ("finished", "error"):
             return False
         request.prefill_time_s += time.perf_counter() - started
         request.prefill_steps += 1
-        request.prompt_cursor += int(request.current_input.shape[1])
-        if request.prompt_cursor < len(request.prompt_token_ids):
+        request.prompt_cursor += chunk_len
+        if not finishes_prompt:
             request.current_input = self._next_prefill_chunk(request)
             return False
         self.capacity.cache_prefix("default", request.prompt_token_ids, request.block_table)
@@ -169,7 +175,14 @@ class PagedModelExecutor:
                 self.finish(request, "capacity_exceeded", "KV cache capacity exceeded")
         return eligible
 
-    def _forward(self, requests: List[RequestState], *, defer_on_capacity: bool, already_eligible: bool = False) -> torch.Tensor:
+    def _forward(
+        self,
+        requests: List[RequestState],
+        *,
+        defer_on_capacity: bool,
+        already_eligible: bool = False,
+        compute_logits: bool = True,
+    ) -> torch.Tensor:
         eligible = requests if already_eligible else self._eligible(requests, defer_on_capacity=defer_on_capacity)
         if not eligible:
             return torch.empty(0, 1, 0, device=self.runtime.device)
@@ -180,12 +193,20 @@ class PagedModelExecutor:
             tables[row, :len(request.block_table)] = torch.tensor(request.block_table, dtype=torch.long, device=self.runtime.device)
         lengths = torch.tensor([request.live_kv_tokens for request in eligible], dtype=torch.long, device=self.runtime.device)
         with torch.inference_mode():
-            logits = self.runtime.model(inputs, block_tables=tables, kv_lens=lengths, paged_kv_caches=self.paged_kv_caches)
+            logits = self.runtime.model(
+                inputs,
+                block_tables=tables,
+                kv_lens=lengths,
+                paged_kv_caches=self.paged_kv_caches,
+                compute_logits=compute_logits,
+                logits_last_only=True,
+            )
         for request in eligible:
             request.live_kv_tokens += int(request.current_input.shape[1])
         return logits
 
     def _sample(self, logits: torch.Tensor, requests: List[RequestState]) -> torch.Tensor:
+        # Model already returns [B, 1, V] when logits_last_only=True.
         next_logits = logits[:, -1, :].clone()
         next_logits = apply_repetition_penalty_(next_logits, [r.seen_token_ids for r in requests], penalty=requests[0].sampling.repetition_penalty)
         if all(r.sampling_generator is None for r in requests):

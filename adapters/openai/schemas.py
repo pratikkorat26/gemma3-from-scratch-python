@@ -59,9 +59,3 @@ class StreamOptions(BaseModel):
 
 
 ChatCompletionRequest.update_forward_refs()
-
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int

@@ -101,13 +101,6 @@ class RequestState:
             created_at_s=created_at_s,
         )
 
-    def should_stop(self) -> bool:
-        if len(self.generated_ids) >= self.max_new_tokens:
-            return True
-        if self.eos_token_id is None:
-            return False
-        return bool(self.generated_ids and self.generated_ids[-1] == self.eos_token_id)
-
 
 @dataclass
 class GenerateResult:

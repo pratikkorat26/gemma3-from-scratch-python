@@ -125,16 +125,9 @@ class PrefixCache:
         oldest_key = min(self._entries, key=lambda k: self._entries[k].last_accessed)
         return self._entries.pop(oldest_key)
 
-    def evict_lru(self) -> Optional[PrefixCacheEntry]:
-        """Explicitly evict the least-recently-used entry."""
-        return self._evict_lru()
-
     def acquire(self, entry: PrefixCacheEntry) -> None:
         """Mark an entry as recently used."""
         entry.last_accessed = time.perf_counter()
-
-    def release(self, entry: PrefixCacheEntry) -> None:
-        """No-op: reference counting lives in the block manager."""
 
     def clear(self) -> None:
         """Remove all entries.  Callers must release returned block references."""

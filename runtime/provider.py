@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -31,8 +32,8 @@ def _load_safetensor_file(path: str) -> Dict[str, torch.Tensor]:
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
+    # Paged KV gather/scatter is currently much faster on CPU than MPS for this model.
+    # Opt into MPS explicitly with --device mps / GEMMA_API_DEVICE=mps when desired.
     return torch.device("cpu")
 
 
@@ -41,6 +42,21 @@ def resolve_device(configured: str = "auto") -> torch.device:
     if configured == "auto":
         return get_device()
     return torch.device(configured)
+
+
+def preferred_dtype(device: torch.device) -> torch.dtype:
+    """Pick a compute dtype that is fast and stable on the target device."""
+    if device.type == "cuda":
+        return torch.bfloat16
+    # MPS float16 has been unstable with this paged-attention path; prefer fp32.
+    return torch.float32
+
+
+def configure_cpu_threads() -> None:
+    raw = os.environ.get("GEMMA_NUM_THREADS")
+    if not raw:
+        return
+    torch.set_num_threads(max(1, int(raw)))
 
 
 def build_repo_id(choose_model: str, use_instruct_model: bool) -> str:
@@ -118,12 +134,15 @@ class GemmaRuntime:
             raise ValueError("This runtime currently supports only choose_model='270m'")
 
         self.device = device or get_device()
+        if self.device.type == "cpu":
+            configure_cpu_threads()
+        self.dtype = preferred_dtype(self.device)
         self.choose_model = choose_model
         self.use_instruct_model = use_instruct_model
         self.repo_id = build_repo_id(choose_model=choose_model, use_instruct_model=use_instruct_model)
         self.local_dir = Path(self.repo_id).name
 
-        self.model = build_gemma3_270m().to(self.device)
+        self.model = build_gemma3_270m()
 
         weights_dict = download_weights(
             repo_id=self.repo_id,
@@ -133,7 +152,13 @@ class GemmaRuntime:
         load_weights_into_gemma(self.model, GEMMA3_CONFIG_270M, weights_dict)
         del weights_dict
 
+        self.model = self.model.to(device=self.device, dtype=self.dtype)
+        self.model.dtype = self.dtype
+
         tokenizer_path = resolve_tokenizer_path(repo_id=self.repo_id, local_dir=self.local_dir)
         self.tokenizer = GemmaTokenizer(tokenizer_path)
 
+        # reduce-overhead / CUDA graphs help on CUDA; on CPU/MPS they often slow cold starts.
+        if self.device.type == "cuda" and os.environ.get("GEMMA_DISABLE_COMPILE", "0") != "1":
+            self.model = torch.compile(self.model, mode="reduce-overhead")
         self.model.eval()
